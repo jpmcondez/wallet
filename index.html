@@ -234,7 +234,7 @@ input[type=number]{-moz-appearance:textfield}
 <script>
 /* ============ Wallet Tracker — core ============ */
 'use strict';
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const LS_DATA = 'wt_data_v1', LS_LOCAL = 'wt_local_v1';
 const COLLECTIONS = ['accounts','txns','categories','installments','recurring','goals','templates','widgets'];
 const ACC_TYPES = {bank:'Bank', ewallet:'E-wallet', cash:'Cash', investment:'Investment', credit:'Credit card', other:'Other'};
@@ -633,6 +633,7 @@ function alerts() {
   const overdue = upcomingBills(addDays(td, -45), addDays(td, -1)).filter(b => !b.posted && !b.r.autoPost);
   for (const b of overdue.slice(0, 3)) out.push({lvl: 'warn', icon: '📅', text: `Bill "${b.r.name}" (${fmt(+b.r.amount)}) from ${fmtDs(b.date)} not marked paid.`, go: () => go('plan', 'recurring')});
   for (const u of unusual().slice(0, 3)) out.push({lvl: 'warn', icon: '🔎', text: u, go: () => go('insights', 'report')});
+  if (typeof extraAlerts === 'function') out.push(...extraAlerts());
   return out;
 }
 function unusual() {
@@ -1027,8 +1028,308 @@ const Sync = (() => {
   return {connect, handleRedirect, run, schedule, disconnect, start, canUse, configured, connected, redirectUri, get status() { return status; }, get msg() { return msg; }};
 })();
 
+/* ============ v1.1 — Financial manager: health, cards mastery ============ */
+const CHANGELOG = {
+  '1.1.0': ['🩺 Financial Health Score (0–100) with tips — Insights › Health', '🛟 Emergency fund meter & income-loss runway', '⚖️ 50/30/20 needs / wants / savings check', '📈 Lifestyle-inflation alerts',
+    '💰 Payday planner for the 10th & 25th — Plan › Payday plan', '✨ Best card per category (set rebate rates per card) + suggestion when adding expenses', '🛡 Interest & fees avoided + fee log — Insights › Card insights', '🏁 Debt payoff planner (avalanche vs snowball) — Insights › Debt payoff']
+};
+const BUCKETS = {need: 'Need', want: 'Want', save: 'Savings'};
+const DEFAULT_BUCKET = {groceries: 'need', transport_gas: 'need', bills_utilities: 'need', load_internet: 'need', health: 'need', education: 'need', family_padala: 'need', fees_charges: 'need', food: 'want', shopping: 'want', entertainment: 'want', subscriptions: 'want', others: 'want'};
+const catBucket = c => c.bucket || DEFAULT_BUCKET[(c.id || '').replace(/^cat_/, '')] || DEFAULT_BUCKET[seedId('', c.name).slice(1)] || 'want';
+
+/* ---------- averages ---------- */
+function dataStart() { const ds = [...txns().map(t => t.date), ...accounts(true).map(a => a.openingDate)].sort(); return ds[0] || today(); }
+/* last n complete months that fall after the data start; falls back to current month pace */
+function monthlyAvg(fn, n = 3) {
+  const start = dataStart(); const vals = [];
+  for (let k = 1; k <= n; k++) { const p = periodOf(today(), 'month', -k); if (p.end < start) break; vals.push(fn(p.start, p.end)); }
+  if (vals.length) return sum(vals) / vals.length;
+  const p = periodOf(today(), 'month'); const el = diffDays(p.start, today()) + 1; return fn(p.start, today()) / el * 30.4;
+}
+const avgSpend = (n = 3) => monthlyAvg((a, b) => spendIn(a, b), n);
+const avgIncome = (n = 3) => monthlyAvg((a, b) => incomeIn(a, b), n);
+
+/* ---------- emergency fund & runway ---------- */
+function efAccounts() { const sel = data.prefs.efAccounts; const liq = accounts().filter(a => a.type !== 'credit' && a.type !== 'investment'); return sel && sel.length ? accounts().filter(a => sel.includes(a.id)) : liq; }
+function emergencyFund() {
+  const target = +data.prefs.efMonths || 6; const exp = avgSpend(3);
+  const essential = monthlyAvg((a, b) => spendIn(a, b, t => catBucket(byId('categories', t.categoryId) || {}) === 'need'), 3);
+  const bal = sum(efAccounts(), a => Math.max(0, balance(a)));
+  const months = exp > 0 ? bal / exp : null; const monthsEss = essential > 0 ? bal / essential : null;
+  return {bal, exp, essential, months, monthsEss, target, need: Math.max(0, target * exp - bal)};
+}
+function runway() { const t = totals(); const exp = avgSpend(3); const debt = sum(cards(), c => cardInfo(c).owed); return {months: exp > 0 ? (t.liquid - debt) / exp : null, liquid: t.liquid, debt, exp}; }
+
+/* ---------- 50/30/20 ---------- */
+function rule503020(p) {
+  const inc = incomeIn(p.start, p.end); const by = {need: 0, want: 0};
+  for (const t of txns()) if (isSpend(t) && inRange(t, p.start, p.end)) { const c = byId('categories', t.categoryId); by[c ? (catBucket(c) === 'save' ? 'want' : catBucket(c)) : 'want'] += +t.amount; }
+  const saveCats = txns().filter(t => isSpend(t) && inRange(t, p.start, p.end) && catBucket(byId('categories', t.categoryId) || {}) === 'save');
+  const savedSpend = sum(saveCats, t => +t.amount); by.want -= savedSpend;
+  const invest = sum(txns().filter(t => t.type === 'transfer' && inRange(t, p.start, p.end) && byId('accounts', t.toAccountId)?.type === 'investment'), t => +t.amount);
+  const save = Math.max(0, inc - by.need - by.want) + savedSpend;
+  return {inc, need: by.need, want: by.want, save, invest};
+}
+
+/* ---------- lifestyle inflation ---------- */
+function inflation() {
+  const per = k => periodOf(today(), 'month', -k);
+  const start = dataStart();
+  const recent = [1, 2, 3].map(per), prior = [4, 5, 6].map(per);
+  if (prior[2].start < start) return null;
+  const s = arr => sum(arr, p => spendIn(p.start, p.end)) / 3, i = arr => sum(arr, p => incomeIn(p.start, p.end)) / 3;
+  const sR = s(recent), sP = s(prior), iR = i(recent), iP = i(prior);
+  return {spendGrowth: sP ? (sR - sP) / sP : 0, incomeGrowth: iP ? (iR - iP) / iP : 0, sR, sP, iR, iP};
+}
+
+/* ---------- card history: interest avoided / charged ---------- */
+function cardHistory(card, months = 12) {
+  const out = []; if (!card.cutoffDay || !card.dueDay) return out;
+  let cut = cutoffOnOrBefore(card, today());
+  for (let k = 0; k < months && cut && cut >= card.openingDate; k++) {
+    const due = dueAfterCutoff(card, cut); const owed = Math.max(0, -balance(card, cut));
+    if (due < today() && owed > 0) {
+      const paid = sum(txns().filter(t => t.date > cut && t.date <= due && (t.toAccountId === card.id || (t.type === 'income' && t.accountId === card.id))), t => +t.amount);
+      out.push({cut, due, owed, paid, full: paid >= owed - 1, interest: owed * (+card.interest || 3) / 100});
+    }
+    cut = cutoffOnOrBefore(card, addDays(cut, -1));
+  }
+  return out;
+}
+function feeLog(days = 365) { return sortTx(txns().filter(t => isSpend(t) && t.date >= addDays(today(), -days) && (t.tags || []).some(x => x === 'interest' || x === 'late-fee' || x === 'card-fee'))); }
+function interestSummary() {
+  let avoided = 0, onTime = 0, late = 0;
+  for (const c of cards()) for (const h of cardHistory(c)) { if (h.full) { avoided += h.interest; onTime++; } else late++; }
+  const fees = feeLog(); return {avoided, onTime, late, fees, feeTotal: sum(fees, t => +t.amount)};
+}
+
+/* ---------- best card per category ---------- */
+const cardRate = (c, catId) => { const r = c.rates || {}; return +(r[catId] ?? r.default ?? 0) || 0; };
+function bestCardFor(catId) {
+  const opts = cards().map(c => ({c, i: cardInfo(c), rate: cardRate(c, catId)})).filter(x => x.i.util == null || x.i.util < 0.8);
+  if (!opts.length) return null;
+  opts.sort((a, b) => (b.rate - a.rate) || ((b.i.floatDays ?? 0) - (a.i.floatDays ?? 0)));
+  const top = opts[0]; if (!top.rate && top.i.floatDays == null) return null; return top;
+}
+function rewardsEarned(a, b) { return sum(txns().filter(t => isSpend(t) && inRange(t, a, b) && isCreditAcc(t.accountId)), t => +t.amount * cardRate(byId('accounts', t.accountId), t.categoryId) / 100); }
+
+/* ---------- health score ---------- */
+function healthScore() {
+  const parts = []; const inc = avgIncome(3), exp = avgSpend(3);
+  const sr = inc > 0 ? (inc - exp) / inc : null;
+  parts.push({key: 'save', label: 'Savings rate', w: 25, score: sr == null ? 50 : clamp(sr / 0.2 * 100, 0, 100), value: sr == null ? 'No income yet' : Math.round(sr * 100) + '% of income',
+    tip: sr == null ? 'Log your salary (10th & 25th) to measure this.' : sr >= .2 ? 'Great — you save at least 20% of income.' : `Aim for 20%: that's about ${fmt(inc * .2 - (inc - exp))} more saved per month.`});
+  const ef = emergencyFund();
+  parts.push({key: 'ef', label: 'Emergency fund', w: 20, score: ef.months == null ? 50 : clamp(ef.months / ef.target * 100, 0, 100), value: ef.months == null ? '—' : ef.months.toFixed(1) + ' months',
+    tip: ef.months == null ? 'Log some spending first.' : ef.months >= ef.target ? `Fully funded (${ef.target} months). 🎉` : `Build ${fmt(ef.need)} more to reach ${ef.target} months.`});
+  const cs = cards().map(c => cardInfo(c)); const lim = sum(cs, i => i.limit), used = sum(cs, i => i.used); const u = lim ? used / lim : null;
+  parts.push({key: 'util', label: 'Card utilization', w: 15, score: u == null ? 70 : u <= .1 ? 100 : u <= .3 ? 100 - (u - .1) / .2 * 30 : u <= .8 ? 70 - (u - .3) / .5 * 70 : 0, value: u == null ? 'Set limits' : Math.round(u * 100) + '%',
+    tip: u == null ? 'Add credit limits on your cards.' : u <= .3 ? 'Healthy — under 30%.' : `Bring it under 30% (pay down ${fmt(used - lim * .3)}).`});
+  const is = interestSummary(); const overdue = cs.filter(i => i.st && i.st.status === 'overdue').length;
+  const payScore = overdue ? 0 : clamp(100 - is.late * 25 - is.fees.length * 15, 0, 100);
+  parts.push({key: 'pay', label: 'On-time payments', w: 15, score: payScore, value: overdue ? `${overdue} overdue` : `${is.onTime} paid in full · ${is.late} not`,
+    tip: overdue ? 'Pay overdue cards now to stop interest and late fees.' : is.late || is.fees.length ? 'Pay the full statement balance before each due date.' : 'Perfect record — keep paying in full.'});
+  const lp = periodOf(today(), 'month', -1); const bc = cats('expense').filter(c => +c.budget);
+  const within = bc.filter(c => spendIn(lp.start, lp.end, t => t.categoryId === c.id) <= +c.budget).length;
+  parts.push({key: 'budget', label: 'Budget discipline', w: 10, score: bc.length ? within / bc.length * 100 : 50, value: bc.length ? `${within}/${bc.length} on budget last month` : 'No budgets',
+    tip: bc.length ? (within === bc.length ? 'All budgets kept last month.' : 'Review categories that went over in Plan › Budgets.') : 'Set budgets for your top spending categories.'});
+  const debt = used; const dti = inc > 0 ? debt / inc : null;
+  parts.push({key: 'debt', label: 'Debt vs income', w: 15, score: dti == null ? 50 : dti <= .3 ? 100 : dti >= 1.5 ? 0 : 100 - (dti - .3) / 1.2 * 100, value: dti == null ? '—' : Math.round(dti * 100) + '% of monthly income',
+    tip: dti == null ? 'Log income to measure this.' : dti <= .3 ? 'Low debt load.' : 'Use Insights › Debt payoff to plan paying it down.'});
+  const total = Math.round(sum(parts, p => p.score * p.w) / sum(parts, p => p.w));
+  const grade = total >= 85 ? 'Excellent' : total >= 70 ? 'Good' : total >= 50 ? 'Fair' : 'Needs work';
+  return {total, grade, parts};
+}
+function gaugeSVG(score, size = 140) {
+  const r = size / 2 - 12, c = Math.PI * r; const pct = clamp(score, 0, 100) / 100;
+  const col = score >= 70 ? 'var(--good)' : score >= 50 ? 'var(--warn)' : 'var(--bad)';
+  return `<svg width="${size}" height="${size / 2 + 14}" viewBox="0 0 ${size} ${size / 2 + 14}" role="img" aria-label="Health score ${score}">
+    <path d="M12 ${size / 2} A ${r} ${r} 0 0 1 ${size - 12} ${size / 2}" fill="none" stroke="var(--surface-2)" stroke-width="12" stroke-linecap="round"/>
+    <path d="M12 ${size / 2} A ${r} ${r} 0 0 1 ${size - 12} ${size / 2}" fill="none" stroke="${col}" stroke-width="12" stroke-linecap="round" stroke-dasharray="${c * pct} ${c}"/>
+    <text x="50%" y="${size / 2 - 4}" text-anchor="middle" font-size="${size / 4.2}" font-weight="700" fill="var(--text)">${score}</text>
+    <text x="50%" y="${size / 2 + 12}" text-anchor="middle" font-size="11" fill="var(--text-2)">out of 100</text></svg>`;
+}
+
+/* ---------- extra alerts ---------- */
+function extraAlerts() {
+  const out = [];
+  const inf = inflation();
+  if (inf && inf.spendGrowth > inf.incomeGrowth + 0.1 && inf.spendGrowth > 0.1) out.push({lvl: 'warn', icon: '📈', text: `Lifestyle inflation: spending is up ${Math.round(inf.spendGrowth * 100)}% vs the previous 3 months, income ${inf.incomeGrowth >= 0 ? 'up' : 'down'} ${Math.abs(Math.round(inf.incomeGrowth * 100))}%.`, go: () => go('insights', 'health')});
+  const ef = emergencyFund();
+  if (ef.months != null && ef.months < 1 && txns().length > 20) out.push({lvl: 'bad', icon: '🛟', text: `Emergency fund covers only ${ef.months.toFixed(1)} month(s) of spending. Target: ${ef.target}.`, go: () => go('insights', 'health')});
+  return out;
+}
+
+/* ---------- payday planner ---------- */
+function paydayPlan(offset = 0) {
+  const p = periodOf(today(), 'cycle', offset); const start = p.start, end = p.end;
+  const recInc = sum(upcomingBills(start, end).filter(b => b.r.type === 'income'), b => +b.r.amount);
+  const logged = incomeIn(start, end);
+  const hist = [1, 2, 3, 4].map(k => periodOf(today(), 'cycle', offset - k)).map(q => incomeIn(q.start, q.end)).filter(x => x > 0);
+  const expected = Math.max(recInc, logged) || (hist.length ? sum(hist) / hist.length : 0);
+  const items = [];
+  for (const c of cards()) {
+    const i = cardInfo(c); if (!i.st) continue;
+    if (i.st.due >= start && i.st.due <= addDays(end, 3)) items.push({kind: 'card', icon: '💳', name: `${c.name} statement`, date: i.st.due, amount: i.st.remaining, done: i.st.remaining <= 0, min: i.st.minDue, card: c});
+  }
+  for (const b of upcomingBills(start, end).filter(b => (b.r.type || 'expense') === 'expense' && !isCreditAcc(b.r.accountId))) items.push({kind: 'bill', icon: '📄', name: b.r.name, date: b.date, amount: +b.r.amount, done: b.posted, bill: b});
+  const share = Math.max(1, (data.prefs.paydays || [10, 25]).length);
+  const budg = cats('expense').filter(c => +c.budget);
+  const budgetLeft = sum(budg, c => Math.max(0, +c.budget / share - spendIn(start, end, t => t.categoryId === c.id && !t.recurringId)));
+  if (budg.length) items.push({kind: 'budget', icon: '🛒', name: 'Day-to-day spending (budgets left)', amount: round2(budgetLeft), done: false});
+  for (const g of live('goals')) {
+    const saved = goalSaved(g); if (saved >= +g.target) continue;
+    const ml = g.deadline ? Math.max(1, Math.ceil(diffDays(today(), g.deadline) / 30.4)) : 12;
+    items.push({kind: 'goal', icon: g.icon || '🎯', name: `Goal: ${g.name}`, amount: round2((+g.target - saved) / ml / share), done: false});
+  }
+  const committed = sum(items.filter(x => !x.done), x => x.amount);
+  return {p, expected, logged, items, committed, left: expected - committed};
+}
+
+/* ---------- debt payoff simulation ---------- */
+function debtList() {
+  return cards().map(c => ({id: c.id, name: c.name, bal: cardInfo(c).owed, rate: (+c.interest || 3) / 100, minPct: (+c.minPct || 3) / 100, minAmt: +c.minAmt || 500})).filter(d => d.bal > 0);
+}
+function simulate(debts, budget, strategy) {
+  const ds = debts.map(d => ({...d}));
+  let month = 0, interest = 0; const done = {};
+  const instMonthly = sum(live('installments'), p => { const s = installmentState(p); return s.left > 0 ? +p.monthly : 0; });
+  while (ds.some(d => d.bal > 0.5) && month < 600) {
+    month++;
+    for (const d of ds) { d.int = 0; if (d.bal > 0) { d.int = d.bal * d.rate; d.bal += d.int; interest += d.int; } }
+    let pool = budget;
+    const live_ = ds.filter(d => d.bal > 0.5);
+    // minimum due ≈ the higher of: % of balance, this month's interest + 1% of principal, or the peso floor
+    for (const d of live_) { const m = Math.min(d.bal, Math.max(d.bal * d.minPct, d.int + (d.bal - d.int) * 0.01, d.minAmt)); d.bal -= m; pool -= m; }
+    if (pool < 0) return {ok: false, need: budget - pool, instMonthly};
+    if (strategy === 'minimums') { for (const d of ds) if (d.bal <= 0.5 && !done[d.id]) { done[d.id] = month; d.bal = 0; } continue; }
+    const order = live_.filter(d => d.bal > 0.5).sort(strategy === 'avalanche' ? (a, b) => b.rate - a.rate || a.bal - b.bal : (a, b) => a.bal - b.bal);
+    for (const d of order) { if (pool <= 0) break; const pay = Math.min(pool, d.bal); d.bal -= pay; pool -= pay; }
+    for (const d of ds) if (d.bal <= 0.5 && !done[d.id]) { done[d.id] = month; d.bal = 0; }
+  }
+  return {ok: month < 600, months: month, interest, done, instMonthly};
+}
+
+/* ---------- views ---------- */
+function insHealth(el) {
+  const h = healthScore(); const ef = emergencyFund(); const rw = runway(); const inf = inflation();
+  ui.ruleOff = ui.ruleOff ?? -1;
+  const rp = periodOf(today(), 'month', ui.ruleOff); const r = rule503020(rp);
+  const pct = x => r.inc ? Math.round(x / r.inc * 100) : 0;
+  const bar = (label, val, target, col) => `<div style="margin:8px 0"><div style="display:flex;justify-content:space-between;font-size:13px"><span>${label}</span><span class="num">${fmt(val)} · <b>${pct(val)}%</b> <span class="sec">(target ${target}%)</span></span></div>
+    <div class="pbar" style="margin-top:4px;position:relative"><i style="width:${clamp(pct(val), 0, 100)}%;background:${col}"></i><span style="position:absolute;left:${target}%;top:-3px;width:2px;height:14px;background:var(--text)"></span></div></div>`;
+  el.innerHTML = `<div class="grid">
+   <div class="card span-4" style="text-align:center"><h3>🩺 Financial Health Score</h3>${gaugeSVG(h.total, 200)}<div style="font-size:18px;font-weight:700;margin-top:4px">${h.grade}</div><p class="small sec">Based on your last 3 months. Updates as you log.</p></div>
+   <div class="card span-8"><h3>What's driving your score</h3><table class="tbl"><tr><th>Factor</th><th>You</th><th class="r">Score</th><th>Next step</th></tr>
+    ${h.parts.map(p => `<tr><td><b>${p.label}</b><div class="small muted">weight ${p.w}%</div></td><td class="small">${esc(p.value)}</td><td class="r"><span class="chip ${p.score >= 70 ? 'good' : p.score >= 50 ? 'warn' : 'bad'}">${Math.round(p.score)}</span></td><td class="small sec">${esc(p.tip)}</td></tr>`).join('')}</table></div>
+   <div class="card span-6"><h3>🛟 Emergency fund</h3>
+    <div style="font-size:28px;font-weight:700" class="num">${ef.months == null ? '—' : ef.months.toFixed(1)} <span class="small sec">of ${ef.target} months</span></div>
+    <div class="pbar" style="margin:8px 0"><i style="width:${ef.months == null ? 0 : clamp(ef.months / ef.target * 100, 0, 100)}%;background:${ef.months >= ef.target ? 'var(--good)' : ef.months >= 3 ? 'var(--accent)' : 'var(--warn)'}"></i></div>
+    <table class="tbl"><tr><td>Emergency savings</td><td class="r num">${fmt(ef.bal)}</td></tr><tr><td>Avg monthly spending</td><td class="r num">${fmt(ef.exp)}</td></tr>
+     <tr><td>Essentials only (Needs)</td><td class="r num">${fmt(ef.essential)} → ${ef.monthsEss == null ? '—' : ef.monthsEss.toFixed(1) + ' mo'}</td></tr><tr><td>To reach target</td><td class="r num">${fmt(ef.need)}</td></tr></table>
+    <div class="actions" style="justify-content:flex-start"><button class="btn sm sec-btn" id="efSet">Choose accounts & target</button></div></div>
+   <div class="card span-6"><h3>⏳ Runway if income stopped</h3>
+    <div style="font-size:28px;font-weight:700" class="num ${rw.months != null && rw.months < 3 ? 'bad' : ''}">${rw.months == null ? '—' : Math.max(0, rw.months).toFixed(1) + ' months'}</div>
+    <p class="small sec">Cash, banks & e-wallets (${fmt(rw.liquid)}) minus card balances (${fmt(rw.debt)}), divided by your average monthly spending (${fmt(rw.exp)}).</p>
+    <h3 style="margin-top:12px">📈 Lifestyle inflation</h3>${inf ? `<table class="tbl"><tr><th></th><th class="r">Prev 3 mo avg</th><th class="r">Last 3 mo avg</th><th class="r">Change</th></tr>
+     <tr><td>Spending</td><td class="r num">${fmt(inf.sP)}</td><td class="r num">${fmt(inf.sR)}</td><td class="r ${inf.spendGrowth > .1 ? 'bad' : ''}">${inf.spendGrowth >= 0 ? '+' : ''}${Math.round(inf.spendGrowth * 100)}%</td></tr>
+     <tr><td>Income</td><td class="r num">${fmt(inf.iP)}</td><td class="r num">${fmt(inf.iR)}</td><td class="r">${inf.incomeGrowth >= 0 ? '+' : ''}${Math.round(inf.incomeGrowth * 100)}%</td></tr></table>
+     <p class="small ${inf.spendGrowth > inf.incomeGrowth + .1 ? 'bad' : 'good'}">${inf.spendGrowth > inf.incomeGrowth + .1 ? '⚠️ Spending is growing faster than income.' : '✓ Spending is in line with income.'}</p>` : '<p class="small muted">Needs 6 months of history.</p>'}</div>
+   <div class="card span-12"><h3><button class="link-btn" id="rPrev">‹</button><span class="grow" style="text-align:center">⚖️ 50/30/20 check — ${rp.label}</span><button class="link-btn" id="rNext">›</button></h3>
+    ${r.inc ? `${bar('🏠 Needs', r.need, 50, 'var(--s1)')}${bar('🎉 Wants', r.want, 30, 'var(--s2)')}${bar('💰 Savings (income left + savings categories)', r.save, 20, 'var(--good)')}
+    <p class="small sec">${pct(r.need) > 50 ? `Needs are above 50% — look at fixed costs (rent, bills, loan payments). ` : ''}${pct(r.want) > 30 ? `Wants are ${pct(r.want) - 30} points over — trimming ${fmt(r.want - r.inc * .3)} gets you to 30%. ` : ''}${pct(r.save) >= 20 ? 'Savings target met. 🎉' : `Saving ${fmt(r.inc * .2 - r.save)} more reaches 20%.`}${r.invest ? ` You moved ${fmt(r.invest)} into investments.` : ''}</p>` : '<div class="empty">No income logged for this month.</div>'}
+    <p class="small muted">Each category is tagged Need, Want or Savings — change it in Settings › Categories.</p></div></div>`;
+  $('#rPrev').onclick = () => { ui.ruleOff--; render(); }; $('#rNext').onclick = () => { if (ui.ruleOff < 0) { ui.ruleOff++; render(); } };
+  $('#efSet').onclick = () => {
+    const sel = data.prefs.efAccounts || [];
+    const m = modal(`<h2><span class="grow">Emergency fund settings</span><button class="icon-btn" onclick="closeModal()">✕</button></h2>
+     <div class="field"><label>Accounts that hold your emergency fund (none = all cash, banks & e-wallets)</label><div class="checks">${accounts().filter(a => a.type !== 'credit').map(a => `<label><input type="checkbox" class="efA" value="${a.id}" ${sel.includes(a.id) ? 'checked' : ''}>${esc(a.name)}</label>`).join('')}</div></div>
+     <div class="field"><label>Target (months of spending)</label><input id="efM" type="number" min="1" max="24" value="${+data.prefs.efMonths || 6}"></div>
+     <div class="actions"><button class="btn sec-btn" onclick="closeModal()">Cancel</button><button class="btn" id="efS">Save</button></div>`);
+    $('#efS').onclick = () => { setPref('efAccounts', $$('.efA:checked', m).map(x => x.value)); setPref('efMonths', +$('#efM').value || 6); save(); closeModal(); render(); };
+  };
+}
+function planPayday(el) {
+  ui.payOff = ui.payOff ?? 0;
+  const pl = paydayPlan(ui.payOff); const override = ui.payInc;
+  const income = override != null ? override : pl.expected; const left = income - pl.committed;
+  el.innerHTML = `<div class="card" style="margin-bottom:12px"><h3><button class="link-btn" id="pyPrev">‹</button><span class="grow" style="text-align:center">💰 Payday plan · ${pl.p.label}</span><button class="link-btn" id="pyNext">›</button></h3>
+   <div class="hero"><div class="stat"><div class="lbl">Expected income this cycle</div><div class="val num good">${fmt(income)}</div><button class="link-btn small" id="pyEdit">edit</button></div>
+    <div class="stat"><div class="lbl">Committed</div><div class="val num">${fmt(pl.committed)}</div></div>
+    <div class="stat"><div class="lbl">${left >= 0 ? 'Unassigned — extra savings or debt' : 'Short by'}</div><div class="val num ${left >= 0 ? 'good' : 'bad'}">${fmt(Math.abs(left))}</div></div></div>
+   <div class="pbar" style="margin-top:10px"><i style="width:${income ? clamp(pl.committed / income * 100, 0, 100) : 0}%;background:${left >= 0 ? 'var(--accent)' : 'var(--bad)'}"></i></div>
+   <p class="small muted">Income comes from your recurring salary items (or the average of recent paydays). Plan your money the moment it lands — before spending.</p></div>
+   <div class="card"><div class="rows">${pl.items.map((x, i) => `<div class="row"><div class="dot" style="background:${x.done ? 'var(--good)' : 'var(--surface-2)'};color:${x.done ? '#fff' : 'var(--text)'}">${x.done ? '✓' : x.icon}</div>
+     <div class="grow"><div class="t1" style="${x.done ? 'text-decoration:line-through;opacity:.6' : ''}">${esc(x.name)}</div><div class="t2">${x.date ? 'Due ' + fmtD(x.date) : x.kind === 'budget' ? 'Remaining budget for this cycle' : 'Suggested per payday'}${x.min ? ` · min ${fmt(x.min)}` : ''}</div></div>
+     <div class="amt num">${fmt(x.amount)}</div>${!x.done && (x.kind === 'card' || x.kind === 'bill') ? `<button class="btn sm" data-pp="${i}">${x.kind === 'card' ? 'Pay' : 'Paid'}</button>` : ''}</div>`).join('') || '<div class="empty">Nothing scheduled this cycle. Add card billing dates, bills, budgets or goals.</div>'}</div>
+     ${left > 0 ? `<div class="banner" style="margin:10px 0 0"><span>💡</span><div class="grow small">${(() => { const ds = debtList().sort((a, b) => b.rate - a.rate); const ef = emergencyFund(); return ef.months != null && ef.months < 3 ? `Put the extra ${fmt(left)} into your emergency fund (${ef.months.toFixed(1)} months now).` : ds.length ? `Put the extra ${fmt(left)} toward ${esc(ds[0].name)} (${(ds[0].rate * 100).toFixed(1)}%/mo interest).` : `Invest or save the extra ${fmt(left)}.`; })()}</div></div>` : ''}</div>`;
+  $('#pyPrev').onclick = () => { ui.payOff--; ui.payInc = null; render(); }; $('#pyNext').onclick = () => { ui.payOff++; ui.payInc = null; render(); };
+  $('#pyEdit').onclick = () => { const v = prompt('Expected income for this cycle (₱):', Math.round(income)); if (v != null && !isNaN(+v)) { ui.payInc = +v; render(); } };
+  $$('[data-pp]', el).forEach(b => b.onclick = () => { const x = pl.items[+b.dataset.pp];
+    if (x.kind === 'card') openTxn({type: 'transfer', toAccountId: x.card.id, amount: x.amount, payee: `${x.card.name} payment`});
+    else { upsert('txns', recTxn(x.bill.r, x.bill.date, x.bill.id)); save(); render(); toast('Marked paid'); } });
+}
+function insDebt(el) {
+  const ds = debtList(); const mins = sum(ds, d => Math.min(d.bal * (1 + d.rate), Math.max(d.bal * (1 + d.rate) * d.minPct, d.bal * d.rate + d.bal * 0.01, d.minAmt)));
+  ui.debtBudget = ui.debtBudget || Math.ceil(Math.max(mins * 1.5, sum(ds, d => d.bal) / 6) / 100) * 100;
+  const B = ui.debtBudget;
+  const av = simulate(ds, B, 'avalanche'), sn = simulate(ds, B, 'snowball'), mn = simulate(ds, mins + 0.01, 'minimums');
+  const plan = s => s.ok ? `${s.months} month${s.months === 1 ? '' : 's'} · debt-free ${fmtMonth(monthKey(addMonths(today(), s.months)))}` : '—';
+  const order = s => s.ok ? Object.entries(s.done).sort((a, b) => a[1] - b[1]).map(([id, m]) => `${esc(accName(id))} <span class="muted">(mo ${m})</span>`).join(' → ') : '';
+  const insts = live('installments').filter(p => installmentState(p).left > 0);
+  el.innerHTML = ds.length ? `<div class="grid">
+   <div class="card span-12"><h3>🏁 Debt payoff planner</h3><div class="hero"><div class="stat"><div class="lbl">Revolving card balances</div><div class="val num">${fmt(sum(ds, d => d.bal))}</div></div>
+    <div class="stat"><div class="lbl">Total minimums / month</div><div class="val num">${fmt(mins)}</div></div>
+    <div class="field" style="margin:0;min-width:200px"><label>I can pay per month ₱</label><input id="dbB" class="inp num" type="number" value="${B}"></div></div>
+    ${!av.ok && av.need ? `<div class="banner bad">That's below your minimums. You need at least ${fmt(mins)}/month.</div>` : ''}</div>
+   <div class="card span-4"><h3>⚡ Avalanche <span class="chip good">saves most</span></h3><p class="small sec">Extra money goes to the highest-interest card first.</p><div class="val num" style="font-size:18px;font-weight:700">${plan(av)}</div><div class="small">Interest paid: <b class="num">${fmt(av.interest || 0)}</b></div><div class="small sec" style="margin-top:6px">${order(av)}</div></div>
+   <div class="card span-4"><h3>⛄ Snowball <span class="chip">quick wins</span></h3><p class="small sec">Extra money goes to the smallest balance first — motivating.</p><div class="val num" style="font-size:18px;font-weight:700">${plan(sn)}</div><div class="small">Interest paid: <b class="num">${fmt(sn.interest || 0)}</b></div><div class="small sec" style="margin-top:6px">${order(sn)}</div></div>
+   <div class="card span-4"><h3>🐢 Minimums only</h3><p class="small sec">What happens if you only pay the minimum due.</p><div class="val num bad" style="font-size:18px;font-weight:700">${mn.ok ? plan(mn) : '50+ years'}</div><div class="small">Interest paid: <b class="num bad">${mn.ok ? fmt(mn.interest) : 'enormous'}</b></div>
+     ${av.ok && mn.ok ? `<div class="small good" style="margin-top:6px">Your plan saves <b>${fmt(mn.interest - av.interest)}</b> and ${mn.months - av.months} months.</div>` : ''}</div>
+   ${insts.length ? `<div class="card span-12"><h3>🗓 Installments (0%, fixed schedule)</h3><p class="small sec">These end on their own; they're billed into your statements each month.</p><div class="rows">${insts.map(p => { const s = installmentState(p); return `<div class="row"><div class="grow"><div class="t1">${esc(p.name)}</div><div class="t2">${esc(accName(p.cardId))} · ${s.left} months left · ends ${fmtMonth(monthKey(addMonths(p.firstDate, p.months - 1)))}</div></div><div class="amt num">${fmt(s.remaining)}</div></div>`; }).join('')}</div></div>` : ''}
+   <p class="small muted span-12">Assumes no new purchases and interest at each card's monthly rate (Settings in each card). In the Philippines card interest is capped at 3%/month.</p></div>`
+    : `<div class="card empty">🎉 No revolving card balances right now. Keep paying statements in full!</div>`;
+  $('#dbB') && ($('#dbB').onchange = e => { ui.debtBudget = Math.max(0, +e.target.value || 0); render(); });
+}
+function cardMasteryHTML() {
+  const is = interestSummary(); const td = today();
+  const exp = cats('expense');
+  const rows = exp.map(c => ({c, b: bestCardFor(c.id)})).filter(x => x.b && x.b.rate);
+  const p = periodOf(td, 'month'); const earned = rewardsEarned(p.start, p.end), earnedY = rewardsEarned(addDays(td, -365), td);
+  return `<div class="card span-6"><h3>🛡 Interest & fees (last 12 months)</h3><div class="hero"><div class="stat"><div class="lbl">Interest avoided by paying in full</div><div class="val num good">${fmt(is.avoided)}</div></div>
+     <div class="stat"><div class="lbl">Statements paid in full</div><div class="val">${is.onTime} <span class="small sec">/ ${is.onTime + is.late}</span></div></div><div class="stat"><div class="lbl">Fees & interest paid</div><div class="val num ${is.feeTotal ? 'bad' : ''}">${fmt(is.feeTotal)}</div></div></div>
+     <div class="rows" style="margin-top:8px">${is.fees.slice(0, 6).map(t => txRow(t)).join('') || '<div class="small muted">No fees or interest logged. 👏 If your statement shows a charge, open the card and tap "Log fee/interest".</div>'}</div></div>
+   <div class="card span-6"><h3>✨ Best card per category</h3><div class="small sec" style="margin-bottom:6px">Estimated rewards: <b class="num">${fmt(earned)}</b> this month · <b class="num">${fmt(earnedY)}</b> last 12 months</div>
+     ${rows.length ? `<table class="tbl"><tr><th>Category</th><th>Use</th><th class="r">Rate</th></tr>${rows.map(x => `<tr><td>${x.c.icon} ${esc(x.c.name)}</td><td><b>${esc(x.b.c.name)}</b></td><td class="r">${x.b.rate}%</td></tr>`).join('')}</table>`
+      : '<div class="small muted">Set rebate / points rates per category on each card (Accounts › card › Edit › Rewards rates) to see which card to swipe.</div>'}</div>`;
+}
+function ratesEditorHTML(a) {
+  const r = a.rates || {};
+  return `<details style="margin-bottom:12px"><summary class="small" style="cursor:pointer;font-weight:600">✨ Rewards rates (% back or points-value % per category)</summary>
+   <p class="small muted">e.g. BPI Petron: Transport/Gas 3, default 0.5. Leave blank to use the default.</p>
+   <div class="frow3"><div class="field"><label>Default %</label><input type="number" step="0.1" class="rateIn" data-cat="default" value="${r.default ?? ''}"></div>
+   ${cats('expense').map(c => `<div class="field"><label>${c.icon} ${esc(c.name)}</label><input type="number" step="0.1" class="rateIn" data-cat="${c.id}" value="${r[c.id] ?? ''}"></div>`).join('')}</div></details>`;
+}
+function readRates(root) { const o = {}; $$('.rateIn', root).forEach(i => { if (i.value !== '') o[i.dataset.cat] = +i.value; }); return o; }
+function homeHealthCard() {
+  const h = healthScore(); const ef = emergencyFund(); const pl = paydayPlan(0);
+  return `<div class="card span-12" id="hCard" style="cursor:pointer"><div class="hero" style="align-items:center;gap:20px">
+    <div style="display:flex;align-items:center;gap:10px">${gaugeSVG(h.total, 110)}<div><div class="small sec">Health score</div><div style="font-weight:700;font-size:16px">${h.grade}</div><div class="small sec">${esc(h.parts.slice().sort((a, b) => a.score - b.score)[0].tip)}</div></div></div>
+    <div class="stat"><div class="lbl">Emergency fund</div><div class="val">${ef.months == null ? '—' : ef.months.toFixed(1) + ' / ' + ef.target + ' mo'}</div></div>
+    <div class="stat"><div class="lbl">This payday cycle</div><div class="val num ${pl.left < 0 ? 'bad' : 'good'}">${pl.left < 0 ? 'Short ' + fmt(-pl.left) : fmt(pl.left) + ' free'}</div><div class="small sec">${pl.p.label}</div></div></div></div>`;
+}
+function whatsNew() {
+  if (local.seenVersion === APP_VERSION) return;
+  const first = !local.seenVersion && !txns().length; local.seenVersion = APP_VERSION; saveLocal();
+  if (first || !CHANGELOG[APP_VERSION]) return;
+  modal(`<h2><span class="grow">🚀 What's new in v${APP_VERSION}</span><button class="icon-btn" onclick="closeModal()">✕</button></h2>
+   <div class="rows">${CHANGELOG[APP_VERSION].map(x => `<div class="row small">${esc(x)}</div>`).join('')}</div>
+   <p class="small muted">Tip: set rebate rates on your cards (Accounts › card › Edit) and your salary as recurring income for the best insights.</p>
+   <div class="actions"><button class="btn" onclick="closeModal();go('insights','health')">See my Health Score</button></div>`);
+}
+
 /* ============ UI ============ */
-const ui = {view: 'home', sub: {accounts: 'wallets', plan: 'budgets', insights: 'forecast'}, act: {q: '', acc: '', cat: '', type: '', month: '', tag: ''}, periodOffset: 0, builder: null};
+const ui = {view: 'home', sub: {accounts: 'wallets', plan: 'budgets', insights: 'health'}, act: {q: '', acc: '', cat: '', type: '', month: '', tag: ''}, periodOffset: 0, builder: null};
 const NAV = [
   ['home', '🏠', 'Home'], ['activity', '🧾', 'Activity'], ['accounts', '💳', 'Accounts'], ['plan', '🎯', 'Plan'], ['insights', '📊', 'Insights'], ['settings', '⚙️', 'Settings']
 ];
@@ -1054,6 +1355,7 @@ function shell() {
     <div class="brand"><div class="logo">₱</div>Wallet</div>
     ${NAV.map(([k, ic, l]) => `<button class="nav-btn" data-nav="${k}"><span class="ic">${ic}</span>${l}</button>`).join('')}
     <div class="spacer"></div>
+    <div class="small muted" style="padding:0 10px 6px">Version ${APP_VERSION}</div>
     <div class="small muted" style="padding:0 10px">Shortcuts: <kbd>N</kbd> expense · <kbd>I</kbd> income · <kbd>T</kbd> transfer · <kbd>H</kbd> hide · <kbd>/</kbd> search</div>
   </aside>
   <main class="main">
@@ -1145,6 +1447,7 @@ function viewHome(v) {
         <div class="stat"><div class="lbl">Safe to spend until ${fmtDs(sts.nextPayday)}</div><div class="val num ${sts.safe < 0 ? 'bad' : ''}">${fmt(sts.safe)}</div><div class="small sec num">${fmt(sts.perDay)}/day · ${sts.days} day(s)</div></div>
       </div>
     </div>
+    ${homeHealthCard()}
     ${al.length ? `<div class="card span-12"><h3>🔔 Alerts <span class="chip">${al.length}</span></h3><div class="rows">${al.slice(0, 6).map((a, i) => `<div class="row click" data-al="${i}"><span>${a.icon}</span><div class="grow small ${a.lvl === 'bad' ? 'bad' : ''}">${esc(a.text)}</div></div>`).join('')}</div></div>` : ''}
     <div class="card span-6"><h3>💳 Credit cards <span class="grow"></span><span class="small sec">Owed incl. installments <b class="num">${fmt(sum(cardList, x => x.i.used))}</b></span></h3>
       ${best ? `<div class="banner" style="margin:0 0 8px;padding:8px 10px"><span>✨</span><div class="grow small">Best card to use today: <b>${esc(best.c.name)}</b> — about <b>${best.i.floatDays} days</b> before payment is due.</div></div>` : `<div class="small muted" style="margin-bottom:8px">Set cut-off & due days on your cards to see due dates and the best card to use.</div>`}
@@ -1168,6 +1471,7 @@ function viewHome(v) {
       <div class="rows" id="recent">${groupedTx(sortTx(txns()).slice(0, 8)) || '<div class="empty">No transactions yet. Tap <b>+</b> to add one, or set your starting balances in Accounts.</div>'}</div></div>
   </div>`;
   $$('[data-al]', v).forEach(r => r.onclick = () => al[+r.dataset.al].go());
+  $('#hCard').onclick = () => go('insights', 'health');
   $$('[data-acc]', v).forEach(r => r.onclick = () => openAccount(r.dataset.acc));
   $('#pPrev').onclick = () => { ui.periodOffset--; render(); }; $('#pNext').onclick = () => { if (ui.periodOffset < 0) { ui.periodOffset++; render(); } };
   $('#seeAll').onclick = () => go('activity');
@@ -1284,7 +1588,7 @@ function openAccount(id) {
       <tr><td>Annual fee</td><td class="r num">${+a.annualFee ? fmt(+a.annualFee) + (a.feeMonth ? ' · bills in ' + MONTHS[a.feeMonth - 1] : '') : '—'}</td></tr>
       ${+a.waiverSpend ? `<tr><td>Fee waiver spend target</td><td class="r num">${fmt(sum(txns().filter(t => t.type === 'expense' && t.accountId === a.id && t.date > addDays(td, -365)), t => +t.amount))} / ${fmt(+a.waiverSpend)}</td></tr>` : ''}
       <tr><td>Interest rate</td><td class="r">${a.interest || 3}% / month</td></tr></table>
-      <div class="actions"><button class="btn sm sec-btn" id="ptsBtn">Update points</button></div></div>`
+      <div class="actions"><button class="btn sm sec-btn" id="feeBtn">Log fee/interest</button><button class="btn sm sec-btn" id="ptsBtn">Update points</button></div></div>`
     : `<div class="stat" style="margin-bottom:14px"><div class="lbl">Current balance</div><div class="big num" style="font-size:30px;font-weight:700">${fmt(balance(a))}</div></div>`}
    <div class="actions" style="justify-content:flex-start;margin-bottom:12px">
      <button class="btn sm" id="accAdd">+ Transaction</button>
@@ -1304,6 +1608,7 @@ function openAccount(id) {
     $('#payFull') && ($('#payFull').onclick = () => openTxn({type: 'transfer', toAccountId: id, amount: i.st.remaining, payee: `${a.name} payment`}));
     $('#addInst').onclick = () => editInstallment(null, id);
     $$('[data-inst]', m).forEach(r => r.onclick = () => editInstallment(r.dataset.inst));
+    $('#feeBtn').onclick = () => { const kind = confirmBox('OK = interest charge · Cancel = late fee / other card fee') ? 'interest' : 'late-fee'; openTxn({type: 'expense', accountId: id, categoryId: 'cat_fees_charges', payee: kind === 'interest' ? `${a.name} interest` : `${a.name} late fee`, tags: [kind]}); };
     $('#ptsBtn').onclick = () => { const v = prompt(`Points/rebate balance for ${a.name}:`, a.points || 0); if (v != null && !isNaN(+v)) { a.points = +v; upsert('accounts', a); save(); openAccount(id); } };
   } else $('#accRecount').onclick = () => recount(id);
 }
@@ -1333,6 +1638,7 @@ function editAccount(id, type = 'bank') {
      <div class="field"><label>Waiver spend target ₱/yr</label><input id="eaWaive" type="number" value="${a.waiverSpend || ''}"></div></div>
     <div class="frow"><div class="field"><label>Points / rebates balance</label><input id="eaPts" type="number" value="${a.points || ''}"></div>
      <div class="field"><label>Rewards note</label><input id="eaPtsN" value="${esc(a.pointsNote || '')}" placeholder="e.g. ₱1 rebate per liter"></div></div>
+    ${ratesEditorHTML(a)}
    </div>
    <label class="toggle"><span>Exclude from net worth</span><input type="checkbox" id="eaEx" ${a.excludeNW ? 'checked' : ''}></label>
    ${id ? `<label class="toggle"><span>Archived (hidden, history kept)</span><input type="checkbox" id="eaArch" ${a.archived ? 'checked' : ''}></label>` : ''}
@@ -1342,7 +1648,7 @@ function editAccount(id, type = 'bank') {
   $('#eaSave').onclick = () => {
     const n = $('#eaName').value.trim(); if (!n) return toast('Name required');
     Object.assign(a, {name: n, type: $('#eaType').value, opening: +$('#eaOpen').value || 0, openingDate: $('#eaOpenD').value || today(), color: $('#eaColor').value, excludeNW: $('#eaEx').checked, archived: $('#eaArch') ? $('#eaArch').checked : false});
-    if (a.type === 'credit') Object.assign(a, {limit: +$('#eaLimit').value || 0, cutoffDay: +$('#eaCut').value || null, dueDay: +$('#eaDue').value || null, minPct: +$('#eaMinP').value || 3, minAmt: +$('#eaMinA').value || 0, interest: +$('#eaInt').value || 3, annualFee: +$('#eaFee').value || 0, feeMonth: +$('#eaFeeM').value || null, waiverSpend: +$('#eaWaive').value || 0, points: +$('#eaPts').value || 0, pointsNote: $('#eaPtsN').value});
+    if (a.type === 'credit') Object.assign(a, {limit: +$('#eaLimit').value || 0, cutoffDay: +$('#eaCut').value || null, dueDay: +$('#eaDue').value || null, minPct: +$('#eaMinP').value || 3, minAmt: +$('#eaMinA').value || 0, interest: +$('#eaInt').value || 3, annualFee: +$('#eaFee').value || 0, feeMonth: +$('#eaFeeM').value || null, waiverSpend: +$('#eaWaive').value || 0, points: +$('#eaPts').value || 0, pointsNote: $('#eaPtsN').value, rates: readRates(m)});
     upsert('accounts', a); save(); closeModal(); render(); toast('Saved');
   };
   $('#eaDel') && ($('#eaDel').onclick = () => {
@@ -1369,7 +1675,7 @@ function recount(id) {
 function payees() { const m = new Map(); for (const t of sortTx(txns()).reverse()) if (t.payee && t.type !== 'adjust') m.set(t.payee.trim(), t); return m; }
 function openTxn(init) {
   const editing = init.id ? byId('txns', init.id) : null;
-  const t = editing ? {...editing} : {id: uid(), type: init.type || 'expense', amount: init.amount || '', accountId: init.accountId || lastUsed('accountId') || accounts()[0]?.id, toAccountId: init.toAccountId || '', categoryId: init.categoryId || '', payee: init.payee || '', date: init.date || today(), tags: [], note: ''};
+  const t = editing ? {...editing} : {id: uid(), type: init.type || 'expense', amount: init.amount || '', accountId: init.accountId || lastUsed('accountId') || accounts()[0]?.id, toAccountId: init.toAccountId || '', categoryId: init.categoryId || '', payee: init.payee || '', date: init.date || today(), tags: init.tags || [], note: ''};
   if (t.type === 'transfer' && t.toAccountId && t.accountId === t.toAccountId) t.accountId = accounts().find(a => a.type !== 'credit' && a.id !== t.toAccountId)?.id;
   const pmap = payees(); const favs = live('templates');
   const accOpts = (sel, excl) => accounts(!!editing).filter(a => a.id !== excl).map(a => `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)}${a.type === 'credit' ? ' 💳' : ''}</option>`).join('');
@@ -1380,6 +1686,7 @@ function openTxn(init) {
    <div class="frow"><div class="field"><label id="txAccL">From account</label><select id="txAcc">${accOpts(t.accountId)}</select></div>
      <div class="field" id="txToF"><label>To account</label><select id="txTo">${accOpts(t.toAccountId)}</select></div>
      <div class="field" id="txCatF"><label>Category</label><select id="txCat"></select></div></div>
+   <div class="small" id="bestHint" style="margin:-4px 0 10px"></div>
    <div class="frow"><div class="field"><label>Payee / description</label><input id="txPayee" list="payeeList" value="${esc(t.payee || '')}" placeholder="e.g. Jollibee, Meralco" autocomplete="off"><datalist id="payeeList">${[...pmap.keys()].slice(-300).map(p => `<option value="${esc(p)}">`).join('')}</datalist></div>
      <div class="field"><label>Date</label><input id="txDate" type="date" value="${t.date}"></div></div>
    <div class="frow"><div class="field"><label>Tags (space separated)</label><input id="txTags" value="${esc((t.tags || []).filter(x => x !== 'recurring' && x !== 'installment').join(' '))}" placeholder="trip-baguio work"></div>
@@ -1394,10 +1701,18 @@ function openTxn(init) {
     $$('#txType button', m).forEach(b => b.classList.toggle('active', b.dataset.k === type));
     $('#txToF').classList.toggle('hidden', type !== 'transfer'); $('#txCatF').classList.toggle('hidden', type === 'transfer' || type === 'adjust');
     $('#txAccL').textContent = type === 'income' ? 'To account' : type === 'adjust' ? 'Account' : 'From account';
-    fillCats();
+    fillCats(); hint();
   };
+  function hint() {
+    const h = $('#bestHint'); if (!h) return; h.innerHTML = '';
+    if (type !== 'expense' || editing) return;
+    const b = bestCardFor($('#txCat').value); if (!b || !b.rate || b.c.id === $('#txAcc').value) return;
+    h.innerHTML = `💡 Best card for ${esc(catName($('#txCat').value))}: <b>${esc(b.c.name)}</b> (${b.rate}% back${b.i.floatDays != null ? `, ${b.i.floatDays} days to pay` : ''}) <button class="link-btn" id="useBest">Use it</button>`;
+    $('#useBest').onclick = () => { $('#txAcc').value = b.c.id; hint(); };
+  }
   $$('#txType button', m).forEach(b => b.onclick = () => { type = b.dataset.k; layout(); });
   layout();
+  $('#txCat').addEventListener('change', hint); $('#txAcc').addEventListener('change', hint);
   $('#txPayee').addEventListener('change', () => { const p = pmap.get($('#txPayee').value.trim()); if (p && !editing) { if (p.type !== 'adjust' && p.type !== type && p.type !== 'transfer') { type = p.type; layout(); } if (p.categoryId) $('#txCat').value = p.categoryId; if (p.accountId) $('#txAcc').value = p.accountId; if (!$('#txAmt').value && p.amount) $('#txAmt').placeholder = '₱' + Math.abs(p.amount) + ' last time'; } });
   $$('[data-fav]', m).forEach(b => b.onclick = () => { const f = byId('templates', b.dataset.fav); type = f.type; layout(); if (f.amount) $('#txAmt').value = f.amount; if (f.accountId) $('#txAcc').value = f.accountId; if (f.categoryId) $('#txCat').value = f.categoryId; if (f.toAccountId) $('#txTo').value = f.toAccountId; $('#txPayee').value = f.payee || f.name; if (f.amount) commit(false); else $('#txAmt').focus(); });
   const commit = (again) => {
@@ -1422,10 +1737,10 @@ function lastUsed() { return local.lastAcc && byId('accounts', local.lastAcc) &&
 /* ---------- PLAN ---------- */
 function viewPlan(v) {
   const sub = ui.sub.plan;
-  v.innerHTML = `<div class="tabs">${[['budgets', 'Budgets'], ['goals', 'Savings goals'], ['recurring', 'Bills & subscriptions'], ['installments', 'Installments'], ['calendar', 'Calendar']].map(([k, l]) => `<button data-sub="${k}" class="${sub === k ? 'active' : ''}">${l}</button>`).join('')}</div><div id="planBody"></div>`;
+  v.innerHTML = `<div class="tabs">${[['budgets', 'Budgets'], ['payday', 'Payday plan'], ['goals', 'Savings goals'], ['recurring', 'Bills & subscriptions'], ['installments', 'Installments'], ['calendar', 'Calendar']].map(([k, l]) => `<button data-sub="${k}" class="${sub === k ? 'active' : ''}">${l}</button>`).join('')}</div><div id="planBody"></div>`;
   $$('[data-sub]', v).forEach(b => b.onclick = () => go('plan', b.dataset.sub));
   const body = $('#planBody');
-  ({budgets: planBudgets, goals: planGoals, recurring: planRecurring, installments: planInstallments, calendar: planCalendar})[sub](body);
+  ({budgets: planBudgets, payday: planPayday, goals: planGoals, recurring: planRecurring, installments: planInstallments, calendar: planCalendar})[sub](body);
 }
 function planBudgets(el) {
   const mode = data.prefs.periodMode; const p = periodOf(today(), mode, ui.periodOffset);
@@ -1551,9 +1866,9 @@ function planCalendar(el) {
 /* ---------- INSIGHTS ---------- */
 function viewInsights(v) {
   const sub = ui.sub.insights;
-  v.innerHTML = `<div class="tabs">${[['forecast', 'Forecast'], ['report', 'Monthly report'], ['cards', 'Card insights'], ['builder', 'Chart builder']].map(([k, l]) => `<button data-sub="${k}" class="${sub === k ? 'active' : ''}">${l}</button>`).join('')}</div><div id="insBody"></div>`;
+  v.innerHTML = `<div class="tabs">${[['health', 'Health'], ['forecast', 'Forecast'], ['report', 'Monthly report'], ['cards', 'Card insights'], ['debt', 'Debt payoff'], ['builder', 'Chart builder']].map(([k, l]) => `<button data-sub="${k}" class="${sub === k ? 'active' : ''}">${l}</button>`).join('')}</div><div id="insBody"></div>`;
   $$('[data-sub]', v).forEach(b => b.onclick = () => go('insights', b.dataset.sub));
-  ({forecast: insForecast, report: insReport, cards: insCards, builder: insBuilder})[sub]($('#insBody'));
+  ({health: insHealth, forecast: insForecast, report: insReport, cards: insCards, debt: insDebt, builder: insBuilder})[sub]($('#insBody'));
 }
 function insForecast(el) {
   const s = safeToSpend(); const pr = monthProjection();
@@ -1617,6 +1932,7 @@ function insCards(el) {
    <div class="card span-12"><h3>✨ Which card to use today</h3><p class="small sec">The card whose cut-off just passed gives you the longest time before payment ("float"). Cards over 80% utilization are skipped.</p>
     <table class="tbl"><tr><th>Card</th><th>Next cut-off</th><th>Pay by</th><th class="r">Days to pay</th><th class="r">Available</th></tr>
     ${cs.filter(x => x.i.floatDays != null).sort((a, b) => b.i.floatDays - a.i.floatDays).map(x => `<tr><td>${best && best.c.id === x.c.id ? '⭐ ' : ''}<b>${esc(x.c.name)}</b></td><td>${fmtDs(x.i.nextCut)}</td><td>${fmtDs(dueAfterCutoff(x.c, x.i.nextCut))}</td><td class="r"><b>${x.i.floatDays}</b></td><td class="r num">${x.i.limit ? fmt(x.i.avail) : '—'}</td></tr>`).join('') || '<tr><td colspan=5 class="muted">Set cut-off and due days on your cards (Accounts → Credit cards → Edit).</td></tr>'}</table></div>
+   ${cardMasteryHTML()}
    <div class="card span-6"><h3>Utilization by card</h3><div id="ciU"></div></div><div class="card span-6"><h3>Card spending per month</h3><div id="ciS"></div></div>
    <div class="card span-12"><h3>Statements</h3><table class="tbl"><tr><th>Card</th><th>Cut-off</th><th>Due</th><th class="r">Statement</th><th class="r">Remaining</th><th class="r">Minimum</th><th>Status</th></tr>
     ${cs.map(x => x.i.st ? `<tr><td>${esc(x.c.name)}</td><td>${fmtDs(x.i.st.cut)}</td><td>${fmtDs(x.i.st.due)}</td><td class="r num">${fmt(x.i.st.statement)}</td><td class="r num">${fmt(x.i.st.remaining)}</td><td class="r num">${fmt(x.i.st.minDue)}</td><td><span class="chip ${({paid: 'good', overdue: 'bad', soon: 'warn', open: ''})[x.i.st.status]}">${({paid: '✓ Paid', overdue: '⛔ Overdue', soon: '⏰ Due soon', open: 'Open'})[x.i.st.status]}</span></td></tr>` : `<tr><td>${esc(x.c.name)}</td><td colspan=6 class="muted">Billing dates not set</td></tr>`).join('')}</table></div></div>`;
@@ -1661,7 +1977,7 @@ function viewSettings(v) {
    <div class="toggle"><span>Paydays (days of month)</span><input id="pdays" class="inp" style="width:120px" value="${(data.prefs.paydays || []).join(', ')}"></div>
    <p class="small muted">Weeks start on Sunday · Currency ₱ PHP · v${APP_VERSION}</p></div>
   <div class="card span-6"><h3><span class="grow">🏷 Categories</span><button class="btn sm sec-btn" id="catAdd">+ Add</button></h3>
-   <div class="rows">${cats().map(c => `<div class="row click" data-cat="${c.id}"><span style="width:24px">${c.icon}</span><div class="grow"><div class="t1">${esc(c.name)}</div><div class="t2">${c.kind}${c.budget ? ' · budget ' + fmt(+c.budget) + '/mo' : ''}</div></div><span class="muted">›</span></div>`).join('')}</div></div>
+   <div class="rows">${cats().map(c => `<div class="row click" data-cat="${c.id}"><span style="width:24px">${c.icon}</span><div class="grow"><div class="t1">${esc(c.name)}</div><div class="t2">${c.kind}${c.kind === 'expense' ? ' · ' + BUCKETS[catBucket(c)] : ''}${c.budget ? ' · budget ' + fmt(+c.budget) + '/mo' : ''}</div></div><span class="muted">›</span></div>`).join('')}</div></div>
   <div class="card span-6"><h3>⭐ Favorites (one-tap entries)</h3>
    <div class="rows">${live('templates').map(f => `<div class="row"><span>${catIcon(f.categoryId)}</span><div class="grow"><div class="t1">${esc(f.name)}</div><div class="t2">${f.type} · ${esc(accName(f.accountId))} · ${f.amount ? fmt(+f.amount) : 'ask amount'}</div></div><button class="btn sm sec-btn" data-fdel="${f.id}">Remove</button></div>`).join('') || '<div class="small muted">Tick "Save as favorite" when adding a transaction (e.g. Jeep ₱13, Coffee ₱150). Favorites with an amount save in one tap.</div>'}</div>
    <h3 style="margin-top:16px">⌨️ Keyboard shortcuts (laptop)</h3>
@@ -1691,8 +2007,9 @@ function editCategory(id) {
    <div class="frow"><div class="field"><label>Name</label><input id="cN" value="${esc(c.name)}" autofocus></div><div class="field"><label>Emoji</label><input id="cI" value="${esc(c.icon)}"></div></div>
    <div class="frow"><div class="field"><label>Type</label><select id="cK"><option value="expense" ${c.kind === 'expense' ? 'selected' : ''}>Expense</option><option value="income" ${c.kind === 'income' ? 'selected' : ''}>Income</option></select></div>
    <div class="field"><label>Monthly budget ₱ (0 = none)</label><input id="cB" type="number" inputmode="decimal" value="${c.budget || ''}"></div></div>
+   <div class="field"><label>50/30/20 type (expenses)</label><select id="cBk">${Object.entries(BUCKETS).map(([k, l]) => `<option value="${k}" ${catBucket(c) === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
    <div class="actions">${id ? `<button class="btn danger sm" id="cDel">Delete</button><span class="grow"></span>` : ''}<button class="btn sec-btn" onclick="closeModal()">Cancel</button><button class="btn" id="cSave">Save</button></div>`);
-  $('#cSave').onclick = () => { if (!$('#cN').value.trim()) return; Object.assign(c, {name: $('#cN').value.trim(), icon: $('#cI').value || '🏷', kind: $('#cK').value, budget: +$('#cB').value || 0}); upsert('categories', c); save(); closeModal(); render(); };
+  $('#cSave').onclick = () => { if (!$('#cN').value.trim()) return; Object.assign(c, {name: $('#cN').value.trim(), icon: $('#cI').value || '🏷', kind: $('#cK').value, budget: +$('#cB').value || 0, bucket: $('#cBk').value}); upsert('categories', c); save(); closeModal(); render(); };
   $('#cDel') && ($('#cDel').onclick = () => { if (used && !confirmBox('Transactions use this category; they will show as "Uncategorized". Delete anyway?')) return; if (!used && !confirmBox('Delete category?')) return; remove('categories', id); save(); closeModal(); render(); });
 }
 
@@ -1780,7 +2097,7 @@ async function boot() {
   await Sync.handleRedirect();
   materialize();
   shell(); keys(); idleWatch(); render();
-  if (local.pin) { unlockCbs.push(() => { render(); Sync.start(); }); showLock(); } else Sync.start();
+  if (local.pin) { unlockCbs.push(() => { render(); Sync.start(); whatsNew(); }); showLock(); } else { Sync.start(); whatsNew(); }
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
   setInterval(() => { if (local._day !== today()) { local._day = today(); materialize(); render(); } }, 60e3);
 }
