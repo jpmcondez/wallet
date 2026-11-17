@@ -210,6 +210,22 @@ kbd{font:11px ui-monospace,monospace;border:1px solid var(--border);border-radiu
 input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 input[type=number]{-moz-appearance:textfield}
 
+#printArea{display:none}
+@media print{
+  body>*:not(#printArea){display:none!important}
+  #printArea{display:block!important;color:#111;font-size:11px;padding:0}
+  #printArea h4{margin:14px 0 6px;font-size:13px}
+  #printArea table{width:100%;border-collapse:collapse}
+  #printArea td,#printArea th{border-bottom:1px solid #ddd;padding:4px;text-align:left}
+  #printArea .r{text-align:right}
+  .pr-head{display:flex;justify-content:space-between;border-bottom:2px solid #2a78d6;padding-bottom:8px;margin-bottom:10px}
+  .pr-t{font-size:20px;font-weight:700}
+  .pr-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0}
+  .pr-grid>div{border:1px solid #ddd;border-radius:6px;padding:6px}
+  .pr-2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  @page{margin:12mm}
+}
+
 </style>
 </head>
 <body>
@@ -234,9 +250,9 @@ input[type=number]{-moz-appearance:textfield}
 <script>
 /* ============ Wallet Tracker — core ============ */
 'use strict';
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const LS_DATA = 'wt_data_v1', LS_LOCAL = 'wt_local_v1';
-const COLLECTIONS = ['accounts','txns','categories','installments','recurring','goals','templates','widgets'];
+const COLLECTIONS = ['accounts','txns','categories','installments','recurring','goals','templates','widgets','sinking','challenges'];
 const ACC_TYPES = {bank:'Bank', ewallet:'E-wallet', cash:'Cash', investment:'Investment', credit:'Credit card', other:'Other'};
 const PALETTE_VARS = ['--s1','--s2','--s3','--s4','--s5','--s6','--s7','--s8'];
 
@@ -353,6 +369,7 @@ function load() {
   for (const k of COLLECTIONS) data[k] = data[k] || [];
   data.prefs = Object.assign({periodMode: 'month', paydays: [10, 25], backupDays: 7, u: 0}, data.prefs || {});
   migrateSeedIds();
+  if (typeof ensureNewSeeds === 'function') ensureNewSeeds();
   saveRaw();
 }
 function saveRaw() {
@@ -744,6 +761,11 @@ function queryChart(spec) {
   const [a, b] = rangeDates(spec); const g = spec.groupBy || 'month';
   const isTime = TIME_GROUPS.includes(g);
   const metric = spec.metric;
+  if (metric === 'balance' && !isTime) {
+    let accs = accounts(true).filter(x => (spec.filters?.accounts?.length ? spec.filters.accounts.includes(x.id) : !x.archived) && x.type !== 'credit');
+    const arr = accs.map(x => [x.name, Math.max(0, balance(x))]).sort((p, q) => q[1] - p[1]);
+    return {labels: arr.map(x => x[0]), datasets: [{label: 'Balance', data: arr.map(x => x[1])}]};
+  }
   if (metric === 'networth' || metric === 'balance') {
     const tb = timeBuckets(a, b, isTime ? g : 'month');
     if (metric === 'networth') return {labels: tb.labels, datasets: [{label: 'Net worth', data: netWorthSeries(tb.ends)}], timeseries: true};
@@ -845,7 +867,7 @@ function renderChart(el, spec) {
       },
       scales: isPie ? {} : {
         x: {stacked: type === 'stacked', grid: {display: isHbar, color: grid}, border: {display: false}, ticks: isHbar ? {callback: unit, maxTicksLimit: 5} : {maxRotation: 0, autoSkip: true, maxTicksLimit: 8}},
-        y: {stacked: type === 'stacked', grid: {display: !isHbar, color: grid}, border: {display: false}, beginAtZero: !['networth', 'balance'].includes(spec.metric), ticks: isHbar ? {autoSkip: false} : {callback: unit, maxTicksLimit: 5}}
+        y: {stacked: type === 'stacked', grid: {display: !isHbar, color: grid}, border: {display: false}, beginAtZero: type === 'stacked' || !['networth', 'balance'].includes(spec.metric), ticks: isHbar ? {autoSkip: false} : {callback: unit, maxTicksLimit: 5}}
       },
       cutout: type === 'doughnut' ? '62%' : undefined,
     }
@@ -1182,6 +1204,7 @@ function paydayPlan(offset = 0) {
     const ml = g.deadline ? Math.max(1, Math.ceil(diffDays(today(), g.deadline) / 30.4)) : 12;
     items.push({kind: 'goal', icon: g.icon || '🎯', name: `Goal: ${g.name}`, amount: round2((+g.target - saved) / ml / share), done: false});
   }
+  for (const f of live('sinking')) { const st = sinkState(f); if (st.left > 0) items.push({kind: 'sink', icon: f.icon || '🪣', name: `Sinking fund: ${f.name}`, amount: round2(st.monthly / share), done: false}); }
   const committed = sum(items.filter(x => !x.done), x => x.amount);
   return {p, expected, logged, items, committed, left: expected - committed};
 }
@@ -1238,7 +1261,9 @@ function insHealth(el) {
    <div class="card span-12"><h3><button class="link-btn" id="rPrev">‹</button><span class="grow" style="text-align:center">⚖️ 50/30/20 check — ${rp.label}</span><button class="link-btn" id="rNext">›</button></h3>
     ${r.inc ? `${bar('🏠 Needs', r.need, 50, 'var(--s1)')}${bar('🎉 Wants', r.want, 30, 'var(--s2)')}${bar('💰 Savings (income left + savings categories)', r.save, 20, 'var(--good)')}
     <p class="small sec">${pct(r.need) > 50 ? `Needs are above 50% — look at fixed costs (rent, bills, loan payments). ` : ''}${pct(r.want) > 30 ? `Wants are ${pct(r.want) - 30} points over — trimming ${fmt(r.want - r.inc * .3)} gets you to 30%. ` : ''}${pct(r.save) >= 20 ? 'Savings target met. 🎉' : `Saving ${fmt(r.inc * .2 - r.save)} more reaches 20%.`}${r.invest ? ` You moved ${fmt(r.invest)} into investments.` : ''}</p>` : '<div class="empty">No income logged for this month.</div>'}
-    <p class="small muted">Each category is tagged Need, Want or Savings — change it in Settings › Categories.</p></div></div>`;
+    <p class="small muted">Each category is tagged Need, Want or Savings — change it in Settings › Categories.</p></div>
+   ${milestoneHTML(false)}</div>`;
+  $('#msEdit') && ($('#msEdit').onclick = () => { const v = prompt('Custom net worth milestone (₱), e.g. 1000000:'); if (v && +v > 0) { setPref('milestones', [...(data.prefs.milestones || []), +v]); save(); render(); } });
   $('#rPrev').onclick = () => { ui.ruleOff--; render(); }; $('#rNext').onclick = () => { if (ui.ruleOff < 0) { ui.ruleOff++; render(); } };
   $('#efSet').onclick = () => {
     const sel = data.prefs.efAccounts || [];
@@ -1316,6 +1341,7 @@ function homeHealthCard() {
   return `<div class="card span-12" id="hCard" style="cursor:pointer"><div class="hero" style="align-items:center;gap:20px">
     <div style="display:flex;align-items:center;gap:10px">${gaugeSVG(h.total, 110)}<div><div class="small sec">Health score</div><div style="font-weight:700;font-size:16px">${h.grade}</div><div class="small sec">${esc(h.parts.slice().sort((a, b) => a.score - b.score)[0].tip)}</div></div></div>
     <div class="stat"><div class="lbl">Emergency fund</div><div class="val">${ef.months == null ? '—' : ef.months.toFixed(1) + ' / ' + ef.target + ' mo'}</div></div>
+    ${milestoneHTML(true)}
     <div class="stat"><div class="lbl">This payday cycle</div><div class="val num ${pl.left < 0 ? 'bad' : 'good'}">${pl.left < 0 ? 'Short ' + fmt(-pl.left) : fmt(pl.left) + ' free'}</div><div class="small sec">${pl.p.label}</div></div></div></div>`;
 }
 function whatsNew() {
@@ -1326,6 +1352,308 @@ function whatsNew() {
    <div class="rows">${CHANGELOG[APP_VERSION].map(x => `<div class="row small">${esc(x)}</div>`).join('')}</div>
    <p class="small muted">Tip: set rebate rates on your cards (Accounts › card › Edit) and your salary as recurring income for the best insights.</p>
    <div class="actions"><button class="btn" onclick="closeModal();go('insights','health')">See my Health Score</button></div>`);
+}
+
+/* ============ v1.2 — Growth, reports & habits ============ */
+CHANGELOG['1.2.0'] = [
+  '🪣 Sinking funds for yearly costs (annual fees, Christmas, LTO, insurance) — Plan › Sinking funds',
+  '📊 Investment tracker: invested vs value, gain & return % (MP2, stocks, UITF, crypto) — Insights › Investments',
+  '🏔 Net worth milestones with ETA — Home & Insights › Health',
+  '🎆 Year in Review incl. 13th month & bonuses — Insights › Year in review',
+  '🔍 Subscription audit: yearly cost, price-hike alerts, 90-day review — Plan › Bills & subscriptions',
+  '📄 Monthly PDF report — Insights › Monthly report › Export PDF',
+  '🗓 Weekly recap on Home + no-spend streaks & challenges — Plan › Challenges'];
+const INV_KINDS = {mp2: 'Pag-IBIG MP2', stocks: 'Stocks', uitf: 'UITF / Mutual fund', crypto: 'Crypto', td: 'Time deposit', other: 'Other'};
+
+/* ---------- seeds added in this version ---------- */
+function ensureNewSeeds() {
+  const has = id => data.categories.some(c => c.id === id);
+  if (!has('cat_bonus_13th_month')) data.categories.push({id: 'cat_bonus_13th_month', name: 'Bonus/13th Month', icon: '🎉', kind: 'income', budget: 0, order: 13.5, u: 1});
+}
+
+/* ---------- sinking funds ---------- */
+function sinkState(f) {
+  const td = today(); const due = f.dueDate || addMonths(td, 12);
+  const months = Math.max(1, Math.ceil(diffDays(td, due) / 30.4));
+  const saved = +f.saved || 0; const left = Math.max(0, +f.target - saved);
+  return {due, months, saved, left, monthly: left / months, pct: +f.target ? saved / +f.target : 0, overdue: due < td && left > 0};
+}
+function planSinking(el) {
+  const fs = live('sinking'); const tot = sum(fs, f => sinkState(f).monthly);
+  const sugg = [];
+  for (const c of cards()) if (+c.annualFee && c.feeMonth && !fs.some(f => f.cardId === c.id)) sugg.push({name: `${c.name} annual fee`, icon: '💳', target: +c.annualFee, month: c.feeMonth, cardId: c.id});
+  const y = pd(today()).getFullYear();
+  for (const s of [{name: 'Christmas & gifts', icon: '🎄', month: 12, day: 15}, {name: 'LTO registration', icon: '🚗', month: null}, {name: 'Insurance premium', icon: '🛡', month: null}, {name: 'Birthdays', icon: '🎂', month: null}, {name: 'Travel', icon: '✈️', month: null}])
+    if (!fs.some(f => f.name === s.name)) sugg.push(s);
+  el.innerHTML = `<div class="card" style="margin-bottom:12px"><div class="hero"><div class="stat"><div class="lbl">Set aside per month</div><div class="val num">${fmt(tot)}</div><div class="small sec">≈ ${fmt(tot / Math.max(1, (data.prefs.paydays || [10, 25]).length))} per payday</div></div>
+    <div class="stat"><div class="lbl">Saved in funds</div><div class="val num">${fmt(sum(fs, f => +f.saved || 0))}</div></div><span style="flex:1"></span><button class="btn" id="sfAdd">+ New fund</button></div>
+    <p class="small muted">Sinking funds spread big yearly costs into small monthly amounts so they never surprise you. They're included in your Payday plan.</p></div>
+   ${fs.length ? `<div class="grid">${fs.map(f => { const s = sinkState(f); return `<div class="card span-4" data-sf="${f.id}" style="cursor:pointer"><h3>${esc(f.icon || '🪣')} ${esc(f.name)}</h3>
+     <div style="font-size:18px;font-weight:700" class="num">${fmt(s.saved)} <span class="small sec">/ ${fmt(+f.target)}</span></div>
+     <div class="pbar" style="margin:8px 0"><i style="width:${clamp(s.pct * 100, 0, 100)}%;background:${s.pct >= 1 ? 'var(--good)' : 'var(--accent)'}"></i></div>
+     <div class="small sec">${s.pct >= 1 ? '✓ Fully funded' : `Save <b class="num">${fmt(s.monthly)}</b>/month`} · due ${fmtD(s.due)}${f.repeat === 'yearly' ? ' · yearly' : ''}${s.overdue ? ' <span class="bad">· past due</span>' : ''}</div></div>`; }).join('')}</div>` : ''}
+   ${sugg.length ? `<div class="card" style="margin-top:12px"><h3>💡 Suggested funds</h3><div class="fav-row" style="flex-wrap:wrap">${sugg.map((s, i) => `<button class="fav" data-sug="${i}">${s.icon} ${esc(s.name)}${s.target ? ' · ' + fmt(s.target, {dec: 0}) : ''}</button>`).join('')}</div></div>` : ''}`;
+  $('#sfAdd').onclick = () => editSinking(null);
+  $$('[data-sf]', el).forEach(c => c.onclick = () => editSinking(c.dataset.sf));
+  $$('[data-sug]', el).forEach(b => b.onclick = () => { const s = sugg[+b.dataset.sug]; let due = '';
+    if (s.month) { due = dayIn(y, s.month - 1, s.day || 1); if (due <= today()) due = dayIn(y + 1, s.month - 1, s.day || 1); }
+    editSinking(null, {name: s.name, icon: s.icon, target: s.target || '', dueDate: due, repeat: 'yearly', cardId: s.cardId}); });
+}
+function editSinking(id, preset = {}) {
+  const f = id ? {...byId('sinking', id)} : {id: uid(), name: '', icon: '🪣', target: '', saved: 0, dueDate: addMonths(today(), 12), repeat: 'yearly', ...preset};
+  const m = modal(`<h2><span class="grow">${id ? 'Edit' : 'New'} sinking fund</span><button class="icon-btn" onclick="closeModal()">✕</button></h2>
+   <div class="frow"><div class="field"><label>Name</label><input id="sfN" value="${esc(f.name)}" placeholder="Christmas & gifts" autofocus></div><div class="field"><label>Emoji</label><input id="sfI" value="${esc(f.icon)}"></div></div>
+   <div class="frow"><div class="field"><label>Amount needed ₱</label><input id="sfT" type="number" inputmode="decimal" value="${f.target}"></div><div class="field"><label>Needed by</label><input id="sfD" type="date" value="${f.dueDate || ''}"></div></div>
+   <div class="frow"><div class="field"><label>Repeats</label><select id="sfR"><option value="yearly" ${f.repeat === 'yearly' ? 'selected' : ''}>Every year</option><option value="none" ${f.repeat !== 'yearly' ? 'selected' : ''}>One time</option></select></div>
+    <div class="field"><label>Saved so far ₱</label><input id="sfS" type="number" inputmode="decimal" value="${f.saved || ''}"></div></div>
+   ${id ? `<div class="frow"><div class="field"><label>Add / withdraw ₱ (− to withdraw)</label><input id="sfP" type="number" inputmode="decimal"></div><div class="field"><label>&nbsp;</label><button class="btn sec-btn" id="sfPB">Apply</button></div></div>` : ''}
+   <p class="small muted">Tip: keep the money in a separate account or e-wallet pocket (e.g. a MariBank or GoTyme goal) and log it here.</p>
+   <div class="actions">${id ? `<button class="btn danger sm" id="sfDel">Delete</button><button class="btn sec-btn sm" id="sfUsed">Spent it ✓</button><span class="grow"></span>` : ''}<button class="btn sec-btn" onclick="closeModal()">Cancel</button><button class="btn" id="sfSave">Save</button></div>`);
+  $('#sfPB') && ($('#sfPB').onclick = () => { $('#sfS').value = round2((+$('#sfS').value || 0) + (+$('#sfP').value || 0)); $('#sfP').value = ''; });
+  const read = () => Object.assign(f, {name: $('#sfN').value.trim(), icon: $('#sfI').value || '🪣', target: +$('#sfT').value || 0, dueDate: $('#sfD').value, repeat: $('#sfR').value, saved: +$('#sfS').value || 0});
+  $('#sfSave').onclick = () => { read(); if (!f.name || !f.target) return toast('Name and amount required'); upsert('sinking', f); save(); closeModal(); render(); };
+  $('#sfDel') && ($('#sfDel').onclick = () => { if (confirmBox('Delete this fund?')) { remove('sinking', id); save(); closeModal(); render(); } });
+  $('#sfUsed') && ($('#sfUsed').onclick = () => { read(); if (f.repeat === 'yearly') { f.saved = 0; f.dueDate = addMonths(f.dueDate || today(), 12); upsert('sinking', f); toast('Reset for next year'); } else remove('sinking', id); save(); closeModal(); render(); });
+}
+
+/* ---------- investments ---------- */
+function invStats(a) {
+  let contrib = +a.opening || 0, income = 0, market = 0;
+  for (const t of txns()) {
+    if (t.date < a.openingDate) continue;
+    if (t.type === 'transfer' && t.toAccountId === a.id) contrib += +t.amount;
+    else if (t.type === 'transfer' && t.accountId === a.id) contrib -= +t.amount;
+    else if (t.type === 'income' && t.accountId === a.id) income += +t.amount;
+    else if (t.type === 'adjust' && t.accountId === a.id) market += +t.amount;
+    else if (t.type === 'expense' && t.accountId === a.id) market -= +t.amount;
+  }
+  const value = balance(a); const gain = value - contrib;
+  return {contrib, value, gain, income, market, ret: contrib > 0 ? gain / contrib : 0};
+}
+function insInvest(el) {
+  const inv = accounts().filter(a => a.type === 'investment').map(a => ({a, s: invStats(a)}));
+  const T = {contrib: sum(inv, x => x.s.contrib), value: sum(inv, x => x.s.value)}; T.gain = T.value - T.contrib;
+  el.innerHTML = inv.length ? `<div class="grid"><div class="card span-12"><div class="hero"><div class="stat"><div class="lbl">Portfolio value</div><div class="big num" style="font-size:28px;font-weight:700">${fmt(T.value)}</div></div>
+     <div class="stat"><div class="lbl">Total invested</div><div class="val num">${fmt(T.contrib)}</div></div><div class="stat"><div class="lbl">Total gain</div><div class="val num ${T.gain >= 0 ? 'good' : 'bad'}">${fmt(T.gain, {sign: true})}</div></div>
+     <div class="stat"><div class="lbl">Overall return</div><div class="val ${T.gain >= 0 ? 'good' : 'bad'}">${T.contrib ? (T.gain / T.contrib * 100).toFixed(1) + '%' : '—'}</div></div><span style="flex:1"></span><button class="btn sec-btn" id="invAdd">+ Add investment</button></div></div>
+    <div class="card span-8"><h3>Holdings</h3><table class="tbl"><tr><th>Investment</th><th class="r">Invested</th><th class="r">Value</th><th class="r">Gain</th><th class="r">Return</th><th></th></tr>
+     ${inv.map(({a, s}) => `<tr><td><b>${esc(a.name)}</b><div class="small muted">${INV_KINDS[a.invKind] || 'Investment'}${s.income ? ' · dividends ' + fmt(s.income) : ''}</div></td><td class="r num">${fmt(s.contrib)}</td><td class="r num">${fmt(s.value)}</td><td class="r num ${s.gain >= 0 ? 'good' : 'bad'}">${fmt(s.gain, {sign: true})}</td><td class="r ${s.gain >= 0 ? 'good' : 'bad'}">${(s.ret * 100).toFixed(1)}%</td>
+      <td class="r" style="white-space:nowrap"><button class="btn sm sec-btn" data-iv="${a.id}">Update value</button> <button class="btn sm" data-ic="${a.id}">+ Invest</button></td></tr>`).join('')}</table>
+     <p class="small muted">"Invested" = starting amount + transfers in − withdrawals. Update value when you check your app/statement; the difference is logged as a market gain/loss. Log dividends (e.g. MP2 yearly) as Income into the investment account.</p></div>
+    <div class="card span-4"><h3>Allocation</h3><div id="invAlloc"></div></div>
+    <div class="card span-12"><h3>Portfolio value over time</h3><div id="invTrend"></div></div></div>`
+    : `<div class="card empty">No investments yet.<br><br><button class="btn" id="invAdd">+ Add investment (MP2, stocks, UITF, crypto…)</button></div>`;
+  $('#invAdd').onclick = () => editAccount(null, 'investment');
+  $$('[data-iv]', el).forEach(b => b.onclick = () => updateValue(b.dataset.iv));
+  $$('[data-ic]', el).forEach(b => b.onclick = () => openTxn({type: 'transfer', toAccountId: b.dataset.ic, payee: `Invest in ${accName(b.dataset.ic)}`}));
+  if (inv.length) {
+    const ids = inv.map(x => x.a.id);
+    renderChart($('#invAlloc'), {metric: 'balance', groupBy: 'account', chartType: 'doughnut', range: 'all', filters: {accounts: ids}, _alloc: true});
+    renderChart($('#invTrend'), {metric: 'balance', groupBy: 'month', range: '12m', chartType: 'stacked', filters: {accounts: ids}});
+  }
+}
+function updateValue(id) {
+  const a = byId('accounts', id); const b = balance(a);
+  modal(`<h2><span class="grow">Update value — ${esc(a.name)}</span><button class="icon-btn" onclick="closeModal()">✕</button></h2>
+   <p class="small sec">Current recorded value: <b class="num">${fmt(b, {force: true})}</b>. Enter today's value from your broker/app.</p>
+   <div class="field"><input id="uvA" type="number" step="0.01" inputmode="decimal" class="amount-input" autofocus></div>
+   <div class="actions"><button class="btn sec-btn" onclick="closeModal()">Cancel</button><button class="btn" id="uvS">Save</button></div>`);
+  $('#uvS').onclick = () => { if ($('#uvA').value === '') return; const d = round2(+$('#uvA').value - b); if (d) upsert('txns', {id: uid(), type: 'adjust', amount: d, accountId: id, date: today(), payee: d >= 0 ? 'Market gain' : 'Market loss', tags: ['market'], note: ''}); save(); closeModal(); render(); toast(`Value updated (${fmt(d, {sign: true})})`); };
+}
+
+/* ---------- milestones ---------- */
+const MILESTONES = [50e3, 100e3, 250e3, 500e3, 750e3, 1e6, 1.5e6, 2e6, 3e6, 5e6, 7.5e6, 10e6, 20e6, 50e6];
+function milestone() {
+  const nw = totals().net;
+  const custom = (data.prefs.milestones || []).map(Number).filter(Boolean);
+  const list = [...new Set([...MILESTONES, ...custom])].sort((a, b) => a - b);
+  const next = list.find(m => m > nw); const prev = [...list].reverse().find(m => m <= nw) || 0;
+  const ms = timeBuckets(dstr(new Date(pd(today()).getFullYear(), pd(today()).getMonth() - 5, 1)), today(), 'month');
+  const {m: slope} = linReg(netWorthSeries(ms.ends));
+  const months = next && slope > 0 ? Math.ceil((next - nw) / slope) : null;
+  return {nw, next, prev, slope, months, eta: months != null ? addMonths(today(), months) : null, pct: next ? (nw - prev) / (next - prev) : 1};
+}
+function milestoneHTML(compact) {
+  const m = milestone(); if (!m.next) return '';
+  const name = v => v >= 1e6 ? '₱' + (v / 1e6) + 'M' : '₱' + (v / 1e3) + 'k';
+  if (compact) return `<div class="stat"><div class="lbl">Next milestone</div><div class="val">${name(m.next)}</div><div class="small sec">${m.eta ? 'ETA ' + fmtMonth(monthKey(m.eta)) : 'grow net worth to estimate'}</div></div>`;
+  return `<div class="card span-12"><h3>🏔 Net worth milestones</h3><div style="display:flex;justify-content:space-between" class="small"><span>${name(m.prev)}</span><b>${fmt(m.nw)}</b><span>${name(m.next)}</span></div>
+   <div class="pbar" style="margin:6px 0"><i style="width:${clamp(m.pct * 100, 0, 100)}%;background:var(--good)"></i></div>
+   <div class="small sec">${m.eta ? `At your current pace (${fmt(m.slope, {sign: true})}/month) you'll reach <b>${name(m.next)}</b> around <b>${fmtMonth(monthKey(m.eta))}</b> — ${m.months} month(s).` : 'Your net worth trend is flat or falling over the last 6 months — the planner can\'t estimate a date yet.'}
+   <button class="link-btn" id="msEdit">Add custom milestone</button></div></div>`;
+}
+
+/* ---------- year in review ---------- */
+function insYear(el) {
+  const y = ui.yearSel || pd(today()).getFullYear(); ui.yearSel = y;
+  const a = `${y}-01-01`, b = `${y}-12-31` > today() ? today() : `${y}-12-31`;
+  const tx = txns().filter(t => inRange(t, a, b));
+  const inc = sum(tx.filter(t => t.type === 'income'), t => +t.amount), exp = sum(tx.filter(isSpend), t => +t.amount);
+  const bonus = sum(tx.filter(t => t.type === 'income' && (t.categoryId === 'cat_bonus_13th_month' || (t.tags || []).some(x => /bonus|13th/.test(x)) || /bonus|13th/i.test(t.payee || ''))), t => +t.amount);
+  const nwS = netWorthSeries([addDays(a, -1), b]);
+  const months = Array.from({length: 12}, (_, i) => `${y}-${pad(i + 1)}`).filter(k => k + '-01' <= b);
+  const mSpend = months.map(k => ({k, s: sum(tx.filter(t => isSpend(t) && monthKey(t.date) === k), t => +t.amount), i: sum(tx.filter(t => t.type === 'income' && monthKey(t.date) === k), t => +t.amount)}));
+  const withData = mSpend.filter(x => x.s || x.i);
+  const big = withData.slice().sort((p, q) => q.s - p.s)[0], best = withData.slice().sort((p, q) => (q.i - q.s) - (p.i - p.s))[0];
+  const byCat = {}; for (const t of tx.filter(isSpend)) byCat[t.categoryId] = (byCat[t.categoryId] || 0) + +t.amount;
+  const topCats = Object.entries(byCat).sort((p, q) => q[1] - p[1]).slice(0, 5);
+  const byPay = {}; for (const t of tx.filter(isSpend)) if (t.payee) byPay[t.payee] = (byPay[t.payee] || 0) + +t.amount;
+  const topPay = Object.entries(byPay).sort((p, q) => q[1] - p[1]).slice(0, 5);
+  const days = diffDays(a, b) + 1; const spendDays = new Set(tx.filter(isSpend).map(t => t.date)).size;
+  const rew = rewardsEarned(a, b);
+  const years = [...new Set([...txns().map(t => +t.date.slice(0, 4)), pd(today()).getFullYear()])].sort();
+  const stat = (l, v, cls = '') => `<div class="stat"><div class="lbl">${l}</div><div class="val num ${cls}">${v}</div></div>`;
+  el.innerHTML = `<div class="card" style="margin-bottom:12px;background:linear-gradient(135deg,var(--s1),var(--s7));color:#fff;border:0"><div style="display:flex;align-items:center;gap:10px"><div style="font-size:26px;font-weight:800;flex:1">🎆 Your ${y} in money</div>
+     <select id="yrSel" class="inp" style="width:auto;color:var(--text)">${years.map(v => `<option ${v === y ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+     <div style="opacity:.9">${y === pd(today()).getFullYear() ? 'So far this year' : 'Full year'} · ${tx.length} transactions logged</div></div>
+   <div class="grid"><div class="card span-12"><div class="hero">${stat('Income', fmt(inc), 'good')}${stat('Of which bonus / 13th month', fmt(bonus))}${stat('Spent', fmt(exp))}${stat('Saved', fmt(inc - exp), inc - exp >= 0 ? 'good' : 'bad')}${stat('Savings rate', inc ? Math.round((inc - exp) / inc * 100) + '%' : '—')}${stat('Net worth change', fmt(nwS[1] - nwS[0], {sign: true}), nwS[1] >= nwS[0] ? 'good' : 'bad')}</div></div>
+    <div class="card span-6"><h3>🏆 Highlights</h3><table class="tbl">
+     ${best ? `<tr><td>Best saving month</td><td class="r"><b>${fmtMonth(best.k)}</b> <span class="num good">${fmt(best.i - best.s, {sign: true})}</span></td></tr>` : ''}
+     ${big ? `<tr><td>Biggest spending month</td><td class="r"><b>${fmtMonth(big.k)}</b> <span class="num">${fmt(big.s)}</span></td></tr>` : ''}
+     <tr><td>No-spend days</td><td class="r"><b>${days - spendDays}</b> of ${days}</td></tr><tr><td>Average spend per day</td><td class="r num">${fmt(exp / days)}</td></tr>
+     <tr><td>Card rewards earned (est.)</td><td class="r num good">${fmt(rew)}</td></tr><tr><td>Interest avoided (last 12 mo)</td><td class="r num good">${fmt(interestSummary().avoided)}</td></tr>
+     ${bonus ? `<tr><td>Bonus saved?</td><td class="r small sec">Tip: put at least half of your 13th month into goals or your emergency fund.</td></tr>` : ''}</table></div>
+    <div class="card span-6"><h3>🧾 Where it went</h3><table class="tbl">${topCats.map(([id, v]) => `<tr><td>${catIcon(id)} ${esc(catName(id))}</td><td class="r num">${fmt(v)}</td><td class="r sec">${exp ? Math.round(v / exp * 100) : 0}%</td></tr>`).join('') || '<tr><td class="muted">No spending yet</td></tr>'}</table>
+     <h3 style="margin-top:12px">🏪 Top merchants</h3><table class="tbl">${topPay.map(([p, v]) => `<tr><td>${esc(p)}</td><td class="r num">${fmt(v)}</td><td class="r sec small">${tx.filter(t => isSpend(t) && t.payee === p).length}×</td></tr>`).join('') || '<tr><td class="muted">—</td></tr>'}</table></div>
+    <div class="card span-12"><h3>Month by month</h3><div id="yrChart"></div></div></div>`;
+  $('#yrSel').onchange = e => { ui.yearSel = +e.target.value; render(); };
+  renderChart($('#yrChart'), {metric: 'cashflow', groupBy: 'month', range: 'custom', from: a, to: b, chartType: 'bar'});
+}
+
+/* ---------- subscription audit ---------- */
+function subscriptionAudit() {
+  const td = today(); const subCat = cats('expense').find(c => /subscri/i.test(c.name));
+  const subs = live('recurring').filter(r => (r.type || 'expense') === 'expense' && ((subCat && r.categoryId === subCat.id) || (r.tags || []).includes('subscription')));
+  return subs.map(r => {
+    const posted = sortTx(txns().filter(t => t.recurringId === r.id || (t.payee && t.payee.toLowerCase() === r.name.toLowerCase() && isSpend(t)))).slice(0, 6);
+    const hist = (r.priceHistory || []).slice(-1)[0];
+    let hike = null;
+    if (hist && hist.amount < +r.amount) hike = {from: hist.amount, to: +r.amount, date: hist.date};
+    else if (posted.length >= 2 && +posted[0].amount > +posted[1].amount + 0.5) hike = {from: +posted[1].amount, to: +posted[0].amount, date: posted[0].date};
+    const reviewed = r.reviewedAt || r.startDate || td; const stale = diffDays(reviewed, td) > 90;
+    return {r, yearly: monthlyCost(r) * 12, hike, stale, reviewed, paused: r.paused};
+  }).sort((a, b) => b.yearly - a.yearly);
+}
+function subAuditHTML() {
+  const a = subscriptionAudit(); if (!a.length) return '';
+  const act = a.filter(x => !x.paused);
+  return `<div class="card span-12"><h3>🔍 Subscription audit <span class="grow"></span><span class="small sec">${fmt(sum(act, x => x.yearly))} / year · ${act.length} active</span></h3>
+   <table class="tbl"><tr><th>Subscription</th><th class="r">Monthly</th><th class="r">Yearly</th><th>Status</th><th></th></tr>
+   ${a.map(x => `<tr><td><b>${esc(x.r.name)}</b>${x.paused ? ' <span class="chip">paused</span>' : ''}</td><td class="r num">${fmt(monthlyCost(x.r))}</td><td class="r num">${fmt(x.yearly)}</td>
+    <td class="small">${x.hike ? `<span class="chip bad">▲ price up ${fmt(x.hike.from)} → ${fmt(x.hike.to)}</span> ` : ''}${x.stale && !x.paused ? `<span class="chip warn">review: still using it?</span>` : !x.hike ? `<span class="sec">reviewed ${fmtDs(x.reviewed)}</span>` : ''}</td>
+    <td class="r" style="white-space:nowrap">${!x.paused ? `<button class="btn sm sec-btn" data-keep="${x.r.id}">Keep ✓</button> <button class="btn sm sec-btn" data-cancel="${x.r.id}">Cancelled</button>` : ''}</td></tr>`).join('')}</table>
+   <p class="small muted">Price changes are detected when you edit the amount or when the charge goes up. Put subscriptions in the "Subscriptions" category.</p></div>`;
+}
+function bindSubAudit(el) {
+  $$('[data-keep]', el).forEach(b => b.onclick = () => { const r = byId('recurring', b.dataset.keep); r.reviewedAt = today(); r.priceHistory = (r.priceHistory || []).filter(h => h.amount >= +r.amount); upsert('recurring', r); save(); render(); toast('Marked as reviewed'); });
+  $$('[data-cancel]', el).forEach(b => b.onclick = () => { const r = byId('recurring', b.dataset.cancel); if (!confirmBox(`Mark ${r.name} as cancelled? It will be paused (history kept). You'll save ${fmt(monthlyCost(r) * 12)} a year.`)) return; r.paused = true; upsert('recurring', r); save(); render(); });
+}
+
+/* ---------- weekly digest & challenges ---------- */
+function streaks() {
+  const td = today(); const spendDays = new Set(txns().filter(t => isSpend(t) && !t.recurringId && !t.installmentId).map(t => t.date));
+  let cur = 0; for (let d = addDays(td, -1); d >= dataStart(); d = addDays(d, -1)) { if (spendDays.has(d)) break; cur++; if (cur > 3650) break; }
+  if (!spendDays.has(td) && cur >= 0) cur += 0;
+  let best = 0, run = 0; for (let d = dataStart(); d < td; d = addDays(d, 1)) { if (spendDays.has(d)) run = 0; else { run++; best = Math.max(best, run); } }
+  return {cur, best, todayClean: !spendDays.has(td)};
+}
+function challengePeriod(ch) { if (ch.start && ch.end) return [ch.start, ch.end]; const ws = weekStart(today()); return ch.period === 'month' ? [periodOf(today(), 'month').start, periodOf(today(), 'month').end] : [ws, addDays(ws, 6)]; }
+function challengeState(ch) {
+  const [a, b] = challengePeriod(ch); const td = today(); const end = b < td ? b : td;
+  const kw = (ch.keyword || '').toLowerCase();
+  const match = t => isSpend(t) && inRange(t, a, end) && (!ch.categoryId || t.categoryId === ch.categoryId) && (!kw || (t.payee || '').toLowerCase().includes(kw) || (t.note || '').toLowerCase().includes(kw));
+  const over = b < td;
+  if (ch.type === 'nospend') {
+    const sd = new Set(txns().filter(t => isSpend(t) && inRange(t, a, end) && !t.recurringId && !t.installmentId).map(t => t.date));
+    const elapsed = diffDays(a, end) + 1; const clean = elapsed - [...sd].filter(d => d <= end).length;
+    const remaining = diffDays(end, b); const possible = clean + remaining;
+    return {a, b, progress: clean, target: +ch.target, pct: clean / Math.max(1, +ch.target), status: clean >= +ch.target ? 'won' : possible < +ch.target ? 'lost' : over ? 'lost' : 'on', label: `${clean} / ${ch.target} no-spend days`};
+  }
+  const spent = sum(txns().filter(match), t => +t.amount); const lim = +ch.limit || 0;
+  return {a, b, progress: spent, target: lim, pct: lim ? spent / lim : spent > 0 ? 1.01 : 0, status: spent > lim ? 'lost' : over ? 'won' : 'on', label: `${fmt(spent)} of ${fmt(lim)} limit`};
+}
+function planChallenges(el) {
+  const chs = live('challenges'); const st = streaks();
+  const tmpls = [
+    {title: '₱0 food delivery this week', type: 'cap', keyword: 'grab food', limit: 0, period: 'week', icon: '🛵'},
+    {title: '3 no-spend days this week', type: 'nospend', target: 3, period: 'week', icon: '🚫'},
+    {title: 'Shopping under ₱1,000 this month', type: 'cap', categoryId: 'cat_shopping', limit: 1000, period: 'month', icon: '🛍️'},
+    {title: 'Coffee under ₱500 this week', type: 'cap', keyword: 'starbucks', limit: 500, period: 'week', icon: '☕'},
+    {title: '10 no-spend days this month', type: 'nospend', target: 10, period: 'month', icon: '🗓'}];
+  el.innerHTML = `<div class="grid"><div class="card span-12"><div class="hero"><div class="stat"><div class="lbl">Current no-spend streak</div><div class="val">🔥 ${st.cur} day${st.cur === 1 ? '' : 's'}</div><div class="small sec">${st.todayClean ? 'Nothing spent today so far 👍' : 'You spent today — streak restarts tomorrow'}</div></div>
+     <div class="stat"><div class="lbl">Longest streak</div><div class="val">🏅 ${st.best} days</div></div><div class="stat"><div class="lbl">Challenges won</div><div class="val">${chs.filter(c => challengeState(c).status === 'won').length}</div></div>
+     <span style="flex:1"></span><button class="btn" id="chAdd">+ New challenge</button></div><p class="small muted">Bills, installments and recurring payments don't break a no-spend day.</p></div>
+    ${chs.map(c => { const s = challengeState(c); return `<div class="card span-6" data-ch="${c.id}" style="cursor:pointer"><h3>${esc(c.icon || '🎯')} <span class="grow">${esc(c.title)}</span><span class="chip ${s.status === 'won' ? 'good' : s.status === 'lost' ? 'bad' : ''}">${s.status === 'won' ? '🏆 Won' : s.status === 'lost' ? 'Missed' : 'In progress'}</span></h3>
+      <div class="pbar"><i style="width:${clamp(s.pct * 100, 0, 100)}%;background:${c.type === 'nospend' ? 'var(--good)' : s.pct > 1 ? 'var(--bad)' : s.pct > .8 ? 'var(--warn)' : 'var(--accent)'}"></i></div>
+      <div class="small sec" style="margin-top:6px">${s.label} · ${fmtDs(s.a)} – ${fmtDs(s.b)}${c.repeat ? ' · repeats' : ''}</div></div>`; }).join('')}
+    <div class="card span-12"><h3>💡 Quick challenges</h3><div class="fav-row" style="flex-wrap:wrap">${tmpls.map((t, i) => `<button class="fav" data-tm="${i}">${t.icon} ${esc(t.title)}</button>`).join('')}</div></div></div>`;
+  $('#chAdd').onclick = () => editChallenge(null);
+  $$('[data-ch]', el).forEach(c => c.onclick = () => editChallenge(c.dataset.ch));
+  $$('[data-tm]', el).forEach(b => b.onclick = () => { const t = tmpls[+b.dataset.tm]; if (t.categoryId && !byId('categories', t.categoryId)) delete t.categoryId; editChallenge(null, {...t, repeat: true}); });
+}
+function editChallenge(id, preset = {}) {
+  const c = id ? {...byId('challenges', id)} : {id: uid(), title: '', icon: '🎯', type: 'cap', period: 'week', limit: 0, target: 3, categoryId: '', keyword: '', repeat: true, ...preset};
+  const m = modal(`<h2><span class="grow">${id ? 'Edit' : 'New'} challenge</span><button class="icon-btn" onclick="closeModal()">✕</button></h2>
+   <div class="seg" id="chT"><button data-k="cap" class="${c.type === 'cap' ? 'active' : ''}">Spending cap</button><button data-k="nospend" class="${c.type === 'nospend' ? 'active' : ''}">No-spend days</button></div>
+   <div class="frow"><div class="field"><label>Title</label><input id="chN" value="${esc(c.title)}" placeholder="₱0 food delivery this week"></div><div class="field"><label>Emoji</label><input id="chI" value="${esc(c.icon)}"></div></div>
+   <div class="frow"><div class="field"><label>Period</label><select id="chP"><option value="week" ${c.period === 'week' ? 'selected' : ''}>This week (Sun–Sat)</option><option value="month" ${c.period === 'month' ? 'selected' : ''}>This month</option></select></div>
+    <div class="field capF"><label>Max spend ₱</label><input id="chL" type="number" inputmode="decimal" value="${c.limit}"></div><div class="field nsF"><label>No-spend days target</label><input id="chG" type="number" value="${c.target}"></div></div>
+   <div class="frow capF"><div class="field"><label>Category (optional)</label><select id="chC"><option value="">Any</option>${cats('expense').map(x => `<option value="${x.id}" ${x.id === c.categoryId ? 'selected' : ''}>${x.icon} ${esc(x.name)}</option>`).join('')}</select></div>
+    <div class="field"><label>Payee contains (optional)</label><input id="chK" value="${esc(c.keyword || '')}" placeholder="grab food"></div></div>
+   <label class="toggle"><span>Repeat every period</span><input type="checkbox" id="chR" ${c.repeat ? 'checked' : ''}></label>
+   <div class="actions">${id ? `<button class="btn danger sm" id="chDel">Delete</button><span class="grow"></span>` : ''}<button class="btn sec-btn" onclick="closeModal()">Cancel</button><button class="btn" id="chS">Save</button></div>`);
+  let type = c.type; const lay = () => { $$('#chT button', m).forEach(b => b.classList.toggle('active', b.dataset.k === type)); $$('.capF', m).forEach(x => x.classList.toggle('hidden', type !== 'cap')); $$('.nsF', m).forEach(x => x.classList.toggle('hidden', type !== 'nospend')); };
+  $$('#chT button', m).forEach(b => b.onclick = () => { type = b.dataset.k; lay(); }); lay();
+  $('#chS').onclick = () => { Object.assign(c, {type, title: $('#chN').value.trim() || (type === 'nospend' ? `${$('#chG').value} no-spend days` : `Spend under ${fmt(+$('#chL').value, {force: true})}`), icon: $('#chI').value || '🎯', period: $('#chP').value, limit: +$('#chL').value || 0, target: +$('#chG').value || 1, categoryId: $('#chC').value, keyword: $('#chK').value.trim(), repeat: $('#chR').checked});
+    if (!c.repeat) { const [a, b] = challengePeriod({...c, start: null, end: null}); c.start = a; c.end = b; } else { c.start = null; c.end = null; }
+    upsert('challenges', c); save(); closeModal(); render(); };
+  $('#chDel') && ($('#chDel').onclick = () => { if (confirmBox('Delete challenge?')) { remove('challenges', id); save(); closeModal(); render(); } });
+}
+function weeklyDigestHTML() {
+  const ws = weekStart(today()); const a = addDays(ws, -7), b = addDays(ws, -1);
+  if (local.digestSeen === a || dataStart() > a) return '';
+  const spent = spendIn(a, b), prev = spendIn(addDays(a, -7), addDays(a, -1)), inc = incomeIn(a, b);
+  const byCat = {}; for (const t of txns()) if (isSpend(t) && inRange(t, a, b)) byCat[t.categoryId] = (byCat[t.categoryId] || 0) + +t.amount;
+  const top = Object.entries(byCat).sort((p, q) => q[1] - p[1])[0];
+  const big = txns().filter(t => isSpend(t) && inRange(t, a, b)).sort((p, q) => q.amount - p.amount)[0];
+  const ns = 7 - new Set(txns().filter(t => isSpend(t) && inRange(t, a, b) && !t.recurringId && !t.installmentId).map(t => t.date)).size;
+  const chg = prev ? (spent - prev) / prev : null; const st = streaks();
+  return `<div class="card span-12" style="border-color:var(--accent)"><h3>🗓 Your week in review <span class="small sec">${fmtDs(a)} – ${fmtDs(b)}</span><span class="grow"></span><button class="link-btn" id="dgX">Dismiss</button></h3>
+   <div class="hero"><div class="stat"><div class="lbl">Spent</div><div class="val num">${fmt(spent)}</div>${chg != null ? `<span class="chip ${chg <= 0 ? 'good' : 'bad'}">${chg <= 0 ? '▼' : '▲'} ${Math.abs(Math.round(chg * 100))}% vs week before</span>` : ''}</div>
+    ${inc ? `<div class="stat"><div class="lbl">Income</div><div class="val num good">${fmt(inc)}</div></div>` : ''}
+    ${top ? `<div class="stat"><div class="lbl">Top category</div><div class="val">${catIcon(top[0])} ${esc(catName(top[0]))}</div><div class="small sec num">${fmt(top[1])}</div></div>` : ''}
+    ${big ? `<div class="stat"><div class="lbl">Biggest expense</div><div class="val num">${fmt(+big.amount)}</div><div class="small sec">${esc(big.payee || catName(big.categoryId))}</div></div>` : ''}
+    <div class="stat"><div class="lbl">No-spend days</div><div class="val">${ns} / 7</div><div class="small sec">streak 🔥 ${st.cur}</div></div></div>
+    <div class="small sec" style="margin-top:8px">${live('challenges').length ? 'Challenges: ' + live('challenges').map(c => `${esc(c.icon)} ${esc(c.title)} — ${({won: '🏆', lost: '✗', on: '…'})[challengeState(c).status]}`).join(' · ') : 'Try a challenge this week → Plan › Challenges'}</div></div>`;
+}
+
+/* ---------- monthly PDF report ---------- */
+async function exportMonthPDF(off = 0) {
+  const p = periodOf(today(), 'month', off), q = periodOf(today(), 'month', off - 1);
+  const inc = incomeIn(p.start, p.end), exp = spendIn(p.start, p.end), pexp = spendIn(q.start, q.end);
+  const nw = netWorthSeries([addDays(p.start, -1), p.end > today() ? today() : p.end]);
+  const h = healthScore(); const r = rule503020(p);
+  const catRows = cats('expense').map(c => ({c, a: spendIn(p.start, p.end, t => t.categoryId === c.id), b: budgetFor(c, 'month'), l: spendIn(q.start, q.end, t => t.categoryId === c.id)})).filter(x => x.a || x.b).sort((x, y) => y.a - x.a);
+  const top = txns().filter(t => isSpend(t) && inRange(t, p.start, p.end)).sort((x, y) => y.amount - x.amount).slice(0, 10);
+  const imgOf = async spec => { if (!window.Chart) return ''; const box = document.createElement('div'); box.style.cssText = 'position:fixed;left:-9999px;top:0;width:700px'; document.body.appendChild(box);
+    const prevAnim = Chart.defaults.animation; Chart.defaults.animation = false; renderChart(box, {...spec, size: 6}); Chart.defaults.animation = prevAnim;
+    const cv = box.querySelector('canvas'); const url = cv ? cv.toDataURL('image/png') : ''; destroyCharts(box); box.remove(); return url ? `<img src="${url}" style="width:100%;max-height:260px;object-fit:contain">` : ''; };
+  const wasHidden = local.hideAmounts; local.hideAmounts = false;
+  const prevTheme = local.theme; if (prevTheme === 'dark') { local.theme = 'light'; applyTheme(); }
+  const c1 = await imgOf({metric: 'expense', groupBy: 'category', range: 'custom', from: p.start, to: p.end, chartType: 'doughnut'});
+  const c2 = await imgOf({metric: 'expense', groupBy: 'day', range: 'custom', from: p.start, to: p.end, chartType: 'bar'});
+  const html = `<div class="pr-head"><div><div class="pr-t">Monthly Money Report</div><div>${p.label}</div></div><div style="text-align:right">Generated ${fmtD(today())}<br>Wallet Tracker v${APP_VERSION}</div></div>
+   <div class="pr-grid"><div><b>Income</b><br>${fmt(inc)}</div><div><b>Spending</b><br>${fmt(exp)}${pexp ? ` (${exp >= pexp ? '+' : ''}${Math.round((exp - pexp) / pexp * 100)}% vs last month)` : ''}</div><div><b>Saved</b><br>${fmt(inc - exp)} ${inc ? `(${Math.round((inc - exp) / inc * 100)}%)` : ''}</div><div><b>Net worth</b><br>${fmt(nw[1])} (${fmt(nw[1] - nw[0], {sign: true})})</div></div>
+   <div class="pr-grid"><div><b>Health score</b><br>${h.total}/100 · ${h.grade}</div><div><b>Needs / Wants / Savings</b><br>${r.inc ? `${Math.round(r.need / r.inc * 100)}% / ${Math.round(r.want / r.inc * 100)}% / ${Math.round(r.save / r.inc * 100)}%` : '—'}</div><div><b>Emergency fund</b><br>${emergencyFund().months?.toFixed(1) ?? '—'} months</div><div><b>Card balances</b><br>${fmt(totals().debt)}</div></div>
+   <div class="pr-2">${c1 ? `<div><h4>Spending by category</h4>${c1}<div style="display:flex;flex-wrap:wrap;gap:4px 10px;font-size:10px">${(() => { const tot = sum(catRows, x => x.a); const sh = catRows.filter(x => x.a); const top = sh.slice(0, sh.length > 7 ? 6 : 7); const oth = sum(sh.slice(top.length), x => x.a); return [...top.map((x, j) => `<span><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${series(j)}"></i> ${esc(x.c.name)} ${Math.round(x.a / tot * 100)}%</span>`), oth ? `<span><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:#8a8984"></i> Other ${Math.round(oth / tot * 100)}%</span>` : ''].join(''); })()}</div></div>` : ''}${c2 ? `<div><h4>Daily spending</h4>${c2}</div>` : ''}</div>
+   <h4>Categories & budgets</h4><table><tr><th>Category</th><th class="r">Spent</th><th class="r">Budget</th><th class="r">Last month</th></tr>${catRows.map(x => `<tr><td>${x.c.icon} ${esc(x.c.name)}</td><td class="r">${fmt(x.a)}</td><td class="r">${x.b ? fmt(x.b) + (x.a > x.b ? ' ⚠' : ' ✓') : '—'}</td><td class="r">${fmt(x.l)}</td></tr>`).join('')}</table>
+   <h4>Credit cards</h4><table><tr><th>Card</th><th class="r">Balance</th><th class="r">Limit used</th><th>Statement</th></tr>${cards().map(c => { const i = cardInfo(c); return `<tr><td>${esc(c.name)}</td><td class="r">${fmt(i.used)}</td><td class="r">${i.limit ? Math.round(i.util * 100) + '%' : '—'}</td><td>${i.st ? (i.st.status === 'paid' ? 'Paid ✓' : `${fmt(i.st.remaining)} due ${fmtDs(i.st.due)}`) : '—'}</td></tr>`; }).join('')}</table>
+   <h4>Largest expenses</h4><table>${top.map(t => `<tr><td>${fmtDs(t.date)}</td><td>${esc(t.payee || catName(t.categoryId))}</td><td>${esc(catName(t.categoryId))} · ${esc(accName(t.accountId))}</td><td class="r">${fmt(+t.amount)}</td></tr>`).join('')}</table>
+   <h4>Top tips</h4><ul>${h.parts.slice().sort((a, b) => a.score - b.score).slice(0, 3).map(x => `<li><b>${x.label}:</b> ${esc(x.tip)}</li>`).join('')}</ul>`;
+  local.hideAmounts = wasHidden; if (prevTheme === 'dark') { local.theme = prevTheme; applyTheme(); }
+  let pr = $('#printArea'); if (!pr) { pr = document.createElement('div'); pr.id = 'printArea'; document.body.appendChild(pr); }
+  pr.innerHTML = html; const oldTitle = document.title; document.title = `Wallet report ${monthKey(p.start)}`;
+  setTimeout(() => { window.print(); setTimeout(() => { document.title = oldTitle; }, 500); }, 300);
 }
 
 /* ============ UI ============ */
@@ -1437,6 +1765,7 @@ function viewHome(v) {
   const maxS = Math.max(1, ...catRows.map(x => Math.max(x.s, x.b)));
   v.innerHTML = `
   <div class="grid">
+    ${weeklyDigestHTML()}
     <div class="card span-12">
       <div class="hero">
         <div><div class="stat"><div class="lbl">Net worth</div></div><div class="big num">${fmt(T.net)}</div>
@@ -1472,6 +1801,7 @@ function viewHome(v) {
   </div>`;
   $$('[data-al]', v).forEach(r => r.onclick = () => al[+r.dataset.al].go());
   $('#hCard').onclick = () => go('insights', 'health');
+  $('#dgX') && ($('#dgX').onclick = () => { local.digestSeen = addDays(weekStart(today()), -7); saveLocal(); render(); });
   $$('[data-acc]', v).forEach(r => r.onclick = () => openAccount(r.dataset.acc));
   $('#pPrev').onclick = () => { ui.periodOffset--; render(); }; $('#pNext').onclick = () => { if (ui.periodOffset < 0) { ui.periodOffset++; render(); } };
   $('#seeAll').onclick = () => go('activity');
@@ -1625,6 +1955,7 @@ function editAccount(id, type = 'bank') {
    <div class="field"><label>Type</label><select id="eaType">${Object.entries(ACC_TYPES).map(([k, l]) => `<option value="${k}" ${a.type === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>
    <div class="frow"><div class="field"><label id="eaOpenLbl">Starting balance</label><input id="eaOpen" type="number" step="0.01" inputmode="decimal" value="${a.opening || ''}" placeholder="0.00"></div>
    <div class="field"><label>As of date</label><input id="eaOpenD" type="date" value="${a.openingDate}"></div></div>
+   <div class="field" id="eaInvF"><label>Investment type</label><select id="eaInv">${Object.entries(INV_KINDS).map(([k, l]) => `<option value="${k}" ${a.invKind === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
    <div class="field"><label>Color</label><input id="eaColor" type="color" value="${a.color}" style="height:40px;padding:2px"></div>
    <div id="eaCard">
     <div class="frow3"><div class="field"><label>Credit limit</label><input id="eaLimit" type="number" inputmode="decimal" value="${a.limit || ''}"></div>
@@ -1643,11 +1974,11 @@ function editAccount(id, type = 'bank') {
    <label class="toggle"><span>Exclude from net worth</span><input type="checkbox" id="eaEx" ${a.excludeNW ? 'checked' : ''}></label>
    ${id ? `<label class="toggle"><span>Archived (hidden, history kept)</span><input type="checkbox" id="eaArch" ${a.archived ? 'checked' : ''}></label>` : ''}
    <div class="actions">${id ? `<button class="btn danger sm" id="eaDel">Delete</button><span class="grow"></span>` : ''}<button class="btn sec-btn" onclick="closeModal()">Cancel</button><button class="btn" id="eaSave">Save</button></div>`);
-  const sync = () => { $('#eaCard').classList.toggle('hidden', !isCard()); $('#eaOpenLbl').textContent = isCard() ? 'Amount owed (as of date)' : 'Starting balance'; };
+  const sync = () => { $('#eaInvF').classList.toggle('hidden', $('#eaType').value !== 'investment'); $('#eaCard').classList.toggle('hidden', !isCard()); $('#eaOpenLbl').textContent = isCard() ? 'Amount owed (as of date)' : 'Starting balance'; };
   $('#eaType').onchange = sync; sync();
   $('#eaSave').onclick = () => {
     const n = $('#eaName').value.trim(); if (!n) return toast('Name required');
-    Object.assign(a, {name: n, type: $('#eaType').value, opening: +$('#eaOpen').value || 0, openingDate: $('#eaOpenD').value || today(), color: $('#eaColor').value, excludeNW: $('#eaEx').checked, archived: $('#eaArch') ? $('#eaArch').checked : false});
+    Object.assign(a, {name: n, type: $('#eaType').value, opening: +$('#eaOpen').value || 0, openingDate: $('#eaOpenD').value || today(), color: $('#eaColor').value, excludeNW: $('#eaEx').checked, invKind: $('#eaType').value === 'investment' ? $('#eaInv').value : undefined, archived: $('#eaArch') ? $('#eaArch').checked : false});
     if (a.type === 'credit') Object.assign(a, {limit: +$('#eaLimit').value || 0, cutoffDay: +$('#eaCut').value || null, dueDay: +$('#eaDue').value || null, minPct: +$('#eaMinP').value || 3, minAmt: +$('#eaMinA').value || 0, interest: +$('#eaInt').value || 3, annualFee: +$('#eaFee').value || 0, feeMonth: +$('#eaFeeM').value || null, waiverSpend: +$('#eaWaive').value || 0, points: +$('#eaPts').value || 0, pointsNote: $('#eaPtsN').value, rates: readRates(m)});
     upsert('accounts', a); save(); closeModal(); render(); toast('Saved');
   };
@@ -1737,10 +2068,10 @@ function lastUsed() { return local.lastAcc && byId('accounts', local.lastAcc) &&
 /* ---------- PLAN ---------- */
 function viewPlan(v) {
   const sub = ui.sub.plan;
-  v.innerHTML = `<div class="tabs">${[['budgets', 'Budgets'], ['payday', 'Payday plan'], ['goals', 'Savings goals'], ['recurring', 'Bills & subscriptions'], ['installments', 'Installments'], ['calendar', 'Calendar']].map(([k, l]) => `<button data-sub="${k}" class="${sub === k ? 'active' : ''}">${l}</button>`).join('')}</div><div id="planBody"></div>`;
+  v.innerHTML = `<div class="tabs">${[['budgets', 'Budgets'], ['payday', 'Payday plan'], ['goals', 'Savings goals'], ['sinking', 'Sinking funds'], ['challenges', 'Challenges'], ['recurring', 'Bills & subscriptions'], ['installments', 'Installments'], ['calendar', 'Calendar']].map(([k, l]) => `<button data-sub="${k}" class="${sub === k ? 'active' : ''}">${l}</button>`).join('')}</div><div id="planBody"></div>`;
   $$('[data-sub]', v).forEach(b => b.onclick = () => go('plan', b.dataset.sub));
   const body = $('#planBody');
-  ({budgets: planBudgets, payday: planPayday, goals: planGoals, recurring: planRecurring, installments: planInstallments, calendar: planCalendar})[sub](body);
+  ({budgets: planBudgets, payday: planPayday, goals: planGoals, sinking: planSinking, challenges: planChallenges, recurring: planRecurring, installments: planInstallments, calendar: planCalendar})[sub](body);
 }
 function planBudgets(el) {
   const mode = data.prefs.periodMode; const p = periodOf(today(), mode, ui.periodOffset);
@@ -1798,8 +2129,10 @@ function planRecurring(el) {
    <div class="card span-6"><h3>🔁 Monthly commitments</h3><div class="hero" style="margin-bottom:10px"><div class="stat"><div class="lbl">All recurring / month</div><div class="val num">${fmt(sum(subs, monthlyCost))}</div></div>
      <div class="stat"><div class="lbl">Subscriptions / month</div><div class="val num">${fmt(sum(subsOnly, monthlyCost))}</div><div class="small sec">${fmt(sum(subsOnly, monthlyCost) * 12)} / year</div></div></div>
      <p class="small muted">Tip: put Netflix/Spotify/iCloud etc. in the "Subscriptions" category to see the yearly cost here.</p></div>
+   ${subAuditHTML()}
    <div class="card span-12"><h3><span class="grow">All recurring items</span><button class="btn sm" id="rAdd">+ Add</button></h3><div class="rows">${rs.map(r => `<div class="row click" data-rec="${r.id}"><div class="dot" style="background:var(--surface-2);color:var(--text)">${r.type === 'income' ? '💼' : catIcon(r.categoryId)}</div><div class="grow"><div class="t1">${esc(r.name)} ${r.paused ? '<span class="chip">paused</span>' : ''} ${r.autoPost ? '<span class="chip">auto-post</span>' : ''}</div><div class="t2">${({monthly: 'Monthly', weekly: 'Weekly', biweekly: 'Every 2 weeks', yearly: 'Yearly'})[r.freq]} from ${fmtD(r.startDate)} · ${esc(accName(r.accountId))}</div></div><div class="amt num ${r.type === 'income' ? 'good' : ''}">${fmt(+r.amount)}</div></div>`).join('') || '<div class="empty">Add rent, Meralco, phone plan, Netflix, tuition, even your salary (10th & 25th) for forecasting.</div>'}</div></div></div>`;
   $('#rAdd').onclick = () => editRecurring(null);
+  bindSubAudit(el);
   $$('[data-rec]', el).forEach(r => r.onclick = () => editRecurring(r.dataset.rec));
   $$('[data-paid]', el).forEach(b => b.onclick = () => { const [rid, d] = b.dataset.paid.split('|'); const r = byId('recurring', rid); upsert('txns', recTxn(r, d, `rec_${rid}_${d}`)); save(); render(); toast('Marked paid'); });
 }
@@ -1820,6 +2153,7 @@ function editRecurring(id) {
     $('#rCat').innerHTML = cats(type === 'income' ? 'income' : 'expense').map(c => `<option value="${c.id}" ${c.id === r.categoryId ? 'selected' : ''}>${c.icon} ${esc(c.name)}</option>`).join(''); };
   $$('#rType button', m).forEach(b => b.onclick = () => { type = b.dataset.k; lay(); }); lay();
   $('#rSave').onclick = () => { if (!$('#rN').value.trim() || !+$('#rA').value) return toast('Name and amount required');
+    if (id && +r.amount && Math.abs(+$('#rA').value) !== +r.amount) r.priceHistory = [...(r.priceHistory || []), {date: today(), amount: +r.amount}].slice(-12);
     Object.assign(r, {name: $('#rN').value.trim(), type, amount: Math.abs(+$('#rA').value), accountId: $('#rAcc').value, categoryId: type === 'transfer' ? null : $('#rCat').value, toAccountId: type === 'transfer' ? $('#rTo').value : null, freq: $('#rF').value, startDate: $('#rD').value || today(), autoPost: $('#rAuto').checked, paused: $('#rP').checked});
     upsert('recurring', r); materialize(); save(); closeModal(); render(); };
   $('#rDel') && ($('#rDel').onclick = () => { if (confirmBox('Delete this recurring item? (Already-logged transactions stay.)')) { remove('recurring', id); save(); closeModal(); render(); } });
@@ -1866,9 +2200,9 @@ function planCalendar(el) {
 /* ---------- INSIGHTS ---------- */
 function viewInsights(v) {
   const sub = ui.sub.insights;
-  v.innerHTML = `<div class="tabs">${[['health', 'Health'], ['forecast', 'Forecast'], ['report', 'Monthly report'], ['cards', 'Card insights'], ['debt', 'Debt payoff'], ['builder', 'Chart builder']].map(([k, l]) => `<button data-sub="${k}" class="${sub === k ? 'active' : ''}">${l}</button>`).join('')}</div><div id="insBody"></div>`;
+  v.innerHTML = `<div class="tabs">${[['health', 'Health'], ['forecast', 'Forecast'], ['report', 'Monthly report'], ['cards', 'Card insights'], ['debt', 'Debt payoff'], ['investments', 'Investments'], ['year', 'Year in review'], ['builder', 'Chart builder']].map(([k, l]) => `<button data-sub="${k}" class="${sub === k ? 'active' : ''}">${l}</button>`).join('')}</div><div id="insBody"></div>`;
   $$('[data-sub]', v).forEach(b => b.onclick = () => go('insights', b.dataset.sub));
-  ({health: insHealth, forecast: insForecast, report: insReport, cards: insCards, debt: insDebt, builder: insBuilder})[sub]($('#insBody'));
+  ({health: insHealth, forecast: insForecast, report: insReport, cards: insCards, debt: insDebt, investments: insInvest, year: insYear, builder: insBuilder})[sub]($('#insBody'));
 }
 function insForecast(el) {
   const s = safeToSpend(); const pr = monthProjection();
@@ -1905,7 +2239,7 @@ function insReport(el) {
   const noSpend = Array.from({length: Math.max(0, days)}, (_, i) => addDays(p.start, i)).filter(d => !txns().some(t => t.date === d && isSpend(t))).length;
   const grade = rate == null ? '—' : rate >= .3 ? 'A' : rate >= .2 ? 'B' : rate >= .1 ? 'C' : rate >= 0 ? 'D' : 'F';
   const delta = (a, b, inv) => { if (!b) return ''; const d = (a - b) / b; const good = inv ? d < 0 : d > 0; return `<span class="chip ${good ? 'good' : 'bad'}">${d > 0 ? '▲' : '▼'} ${Math.abs(Math.round(d * 100))}%</span>`; };
-  el.innerHTML = `<div class="card" style="margin-bottom:12px"><h3><button class="link-btn" id="rPrev">‹</button><span class="grow" style="text-align:center">${p.label} report</span><button class="link-btn" id="rNext">›</button></h3>
+  el.innerHTML = `<div class="card" style="margin-bottom:12px"><h3><button class="link-btn" id="rPrev">‹</button><span class="grow" style="text-align:center">${p.label} report</span><button class="link-btn" id="rNext">›</button><button class="btn sm" id="rPdf">📄 Export PDF</button></h3>
    <div class="hero"><div style="font-size:44px;font-weight:800;color:${grade < 'C' ? 'var(--good)' : grade === 'C' ? 'var(--warn)' : 'var(--bad)'}">${grade}</div>
     <div class="stat"><div class="lbl">Income</div><div class="val num good">${fmt(inc)}</div>${delta(inc, pinc)}</div><div class="stat"><div class="lbl">Spending</div><div class="val num">${fmt(exp)}</div>${delta(exp, pexp, true)}</div>
     <div class="stat"><div class="lbl">Saved</div><div class="val num ${inc - exp < 0 ? 'bad' : ''}">${fmt(inc - exp)}</div><div class="small sec">${rate == null ? '' : Math.round(rate * 100) + '% savings rate'}</div></div>
@@ -1917,6 +2251,7 @@ function insReport(el) {
     <div class="card span-6"><h3>Biggest expenses</h3><div class="rows">${top.map(t => txRow(t)).join('') || '<div class="empty">—</div>'}</div>
      <h3 style="margin-top:14px">🔎 Unusual activity</h3>${unusual().map(u => `<div class="small" style="padding:4px 0">• ${esc(u)}</div>`).join('') || '<div class="small muted">Nothing unusual. 👍</div>'}</div>
     <div class="card span-6"><h3>Spending by weekday</h3><div id="rWd"></div></div><div class="card span-6"><h3>Spending by account</h3><div id="rAcc"></div></div></div>`;
+  $('#rPdf').onclick = () => exportMonthPDF(ui.repOff);
   $('#rPrev').onclick = () => { ui.repOff--; render(); }; $('#rNext').onclick = () => { if (ui.repOff < 0) { ui.repOff++; render(); } };
   bindTxRows(el);
   const rng = {range: 'custom', from: p.start, to: p.end};
